@@ -148,7 +148,7 @@ chimera_vfs_claim_contended_floor(
     const struct chimera_vfs_claim *probe,
     const struct chimera_vfs_claim *holder);
 
-/* Insert / remove a claim on its file class list; caller holds file->lock. */
+/* Insert / remove a claim from its per-file index; caller holds file->lock. */
 void
 chimera_vfs_claim_link_locked(
     struct chimera_vfs_file_state *file,

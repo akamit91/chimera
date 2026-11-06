@@ -345,6 +345,271 @@ test_range_zero_length(void)
     chimera_vfs_state_destroy(state);
 } /* test_range_zero_length */
 
+static uint32_t
+range_test_random(uint32_t *state)
+{
+    *state = *state * 1664525U + 1013904223U;
+    return *state;
+} /* range_test_random */
+
+static void
+test_range_tree_randomized_differential(void)
+{
+    enum { CLAIM_COUNT = 80, PROBE_COUNT = 120 };
+    struct chimera_vfs_state      *state             = chimera_vfs_state_init();
+    struct chimera_vfs_file_state *file              = get_file(state, 1);
+    struct chimera_vfs_claim       held[CLAIM_COUNT] = { 0 };
+    struct chimera_claim_owner     owners[CLAIM_COUNT];
+    bool                           active[CLAIM_COUNT];
+    bool                           valid        = true;
+    uint32_t                       random_state = 0x54038U;
+    int                            query;
+    int                            i;
+
+    fprintf(stderr, "\ntest_range_tree_randomized_differential\n");
+    memset(active, 0, sizeof(active));
+    for (i = 0; i < CLAIM_COUNT; i++) {
+        uint32_t r      = range_test_random(&random_state);
+        uint64_t offset = i % 3 == 0 ? (uint64_t) (i % 8) * 25 : r % 400;
+        uint64_t length;
+
+        if (i == 0 || i == 10) {
+            offset = 64;
+            length = 32;
+        } else if (i % 17 == 0) {
+            offset = UINT64_MAX - (r % 32);
+            length = UINT64_MAX;
+        } else if (i % 11 == 0) {
+            length = 0;
+        } else {
+            length = 1 + range_test_random(&random_state) % 90;
+        }
+        init_owner(&owners[i], CHIMERA_CLAIM_PROTO_NLM, 100 + i, i + 1);
+        chimera_vfs_claim_init_range(&held[i], false, false, offset, length,
+                                     &owners[i]);
+        if (chimera_vfs_claim_try_acquire(state, file, &held[i], NULL) !=
+            CHIMERA_CLAIM_GRANTED) {
+            valid = false;
+        } else {
+            active[i] = true;
+        }
+    }
+
+    for (query = 0; query < PROBE_COUNT; query++) {
+        struct chimera_vfs_claim      probe;
+        struct chimera_claim_owner    owner;
+        uint32_t                      r          = range_test_random(&random_state);
+        int                           same_owner = query % 4 == 0
+            ? (int) (r % CLAIM_COUNT) : -1;
+        uint64_t                      offset;
+        uint64_t                      length;
+        bool                          expected = false;
+        enum chimera_vfs_claim_result result;
+
+        if (query % 13 == 0) {
+            offset = UINT64_MAX - (r % 64);
+            length = (query % 26 == 0) ? UINT64_MAX : 1 + (r % 80);
+        } else {
+            offset = r % 500;
+            length = query % 9 == 0 ? 0 : 1 + (r % 100);
+        }
+        if (same_owner >= 0) {
+            owner = owners[same_owner];
+        } else {
+            init_owner(&owner, CHIMERA_CLAIM_PROTO_NLM, 10000 + query,
+                       10000 + query);
+        }
+        chimera_vfs_claim_init_range(&probe, true, false, offset, length,
+                                     &owner);
+        for (i = 0; i < CLAIM_COUNT; i++) {
+            if (active[i] && i != same_owner &&
+                chimera_vfs_claim_range_overlap_i(held[i].offset,
+                                                  held[i].length,
+                                                  offset, length)) {
+                expected = true;
+                break;
+            }
+        }
+        result = chimera_vfs_claim_test(file, &probe, NULL);
+        if ((result == CHIMERA_CLAIM_DENIED) != expected) {
+            valid = false;
+        }
+    }
+
+    for (i = CLAIM_COUNT - 1; i >= 0; i--) {
+        struct chimera_vfs_claim   probe;
+        struct chimera_claim_owner owner;
+        bool                       expected = false;
+        int                        j;
+
+        chimera_vfs_claim_release(state, file, &held[i]);
+        active[i] = false;
+        init_owner(&owner, CHIMERA_CLAIM_PROTO_NLM, 20000 + i, 30000 + i);
+        chimera_vfs_claim_init_range(&probe, true, false,
+                                     i % 5 == 0 ? UINT64_MAX - 8 : i * 7,
+                                     i % 5 == 0 ? UINT64_MAX : 31, &owner);
+        for (j = 0; j < CLAIM_COUNT; j++) {
+            if (active[j] && chimera_vfs_claim_range_overlap_i(
+                    held[j].offset, held[j].length,
+                    probe.offset, probe.length)) {
+                expected = true;
+                break;
+            }
+        }
+        if ((chimera_vfs_claim_test(file, &probe, NULL) ==
+             CHIMERA_CLAIM_DENIED) != expected) {
+            valid = false;
+        }
+    }
+
+    CHECK(valid && interval_tree_empty(&file->range_tree),
+          "range tree admission matches linear overlap model across add/remove");
+    chimera_vfs_state_put(state, file);
+    chimera_vfs_state_destroy(state);
+} /* test_range_tree_randomized_differential */
+
+struct range_scan_count {
+    int count;
+};
+
+static void
+range_scan_count_claim(
+    const struct chimera_vfs_claim *claim,
+    void                           *private_data)
+{
+    struct range_scan_count *count = private_data;
+
+    assert(claim->klass == CHIMERA_CLAIM_CLASS_RANGE);
+    count->count++;
+} /* range_scan_count_claim */
+
+static void
+test_range_tree_carve_and_scan(void)
+{
+    struct chimera_vfs_state       *state = chimera_vfs_state_init();
+    struct chimera_vfs_file_state  *file  = get_file(state, 1);
+    struct chimera_vfs_claim        held, left, right;
+    struct chimera_vfs_claim       *spare[] = { &left, &right };
+    struct chimera_claim_owner      owner;
+    struct chimera_vfs_claim_filter filter = {
+        .klass_mask = 1u << CHIMERA_CLAIM_CLASS_RANGE,
+    };
+    struct range_scan_count         scan       = { 0 };
+    int                             spare_used = 0;
+
+    fprintf(stderr, "\ntest_range_tree_carve_and_scan\n");
+    init_owner(&owner, CHIMERA_CLAIM_PROTO_NLM, 0xA, 1);
+    chimera_vfs_claim_init_range(&held, true, false, 100, 100, &owner);
+    assert(chimera_vfs_claim_try_acquire(state, file, &held, NULL) ==
+           CHIMERA_CLAIM_GRANTED);
+
+    chimera_vfs_claim_range_replace(state, file, &owner, NULL, 130, 40, 0,
+                                    spare, 2, &spare_used, NULL, NULL);
+    chimera_vfs_claim_scan(file, &filter, range_scan_count_claim, &scan);
+    CHECK(spare_used == 2 && scan.count == 2 &&
+          chimera_vfs_claim_range_owner_holds(file, &owner, NULL, 110, 1) &&
+          !chimera_vfs_claim_range_owner_holds(file, &owner, NULL, 140, 1) &&
+          chimera_vfs_claim_range_owner_holds(file, &owner, NULL, 180, 1),
+          "partial unlock indexes both remainders and scans the range tree");
+
+    chimera_vfs_claim_release(state, file, &left);
+    chimera_vfs_claim_release(state, file, &right);
+    chimera_vfs_state_put(state, file);
+    chimera_vfs_state_destroy(state);
+} /* test_range_tree_carve_and_scan */
+
+static void
+test_range_tree_mandatory_io(void)
+{
+    struct chimera_vfs_state      *state = chimera_vfs_state_init();
+    struct chimera_vfs_file_state *file  = get_file(state, 7);
+    struct chimera_vfs_claim       lock;
+    struct chimera_claim_owner     owner;
+    struct chimera_claim_actor     actor;
+    uint8_t                        fh[CHIMERA_VFS_FH_SIZE];
+    uint64_t                       fh_hash;
+    bool                           denied_overlap, allowed_disjoint;
+    bool                           allowed_owner;
+
+    fprintf(stderr, "\ntest_range_tree_mandatory_io\n");
+    make_fh(fh, 7);
+    fh_hash = chimera_vfs_hash(fh, sizeof(fh));
+    init_owner(&owner, CHIMERA_CLAIM_PROTO_SMB2, 0xA, 1);
+    memset(&actor, 0, sizeof(actor));
+    actor.owner = owner;
+    chimera_vfs_claim_init_range(&lock, true, true, 500, 100, &owner);
+    assert(chimera_vfs_claim_try_acquire(state, file, &lock, NULL) ==
+           CHIMERA_CLAIM_GRANTED);
+
+    init_owner(&actor.owner, CHIMERA_CLAIM_PROTO_SMB2, 0xB, 2);
+    denied_overlap = chimera_vfs_claim_io_denied(state, fh, sizeof(fh), fh_hash,
+                                                 550, 10, true, &actor);
+    allowed_disjoint = !chimera_vfs_claim_io_denied(
+        state, fh, sizeof(fh), fh_hash, 100, 10, true, &actor);
+    actor.owner   = owner;
+    allowed_owner = !chimera_vfs_claim_io_denied(
+        state, fh, sizeof(fh), fh_hash, 550, 10, true, &actor);
+
+    CHECK(denied_overlap && allowed_disjoint && allowed_owner,
+          "mandatory I/O checks find overlapping locks through the range tree");
+    chimera_vfs_claim_release(state, file, &lock);
+    chimera_vfs_state_put(state, file);
+    chimera_vfs_state_destroy(state);
+} /* test_range_tree_mandatory_io */
+
+static void
+range_release_count(
+    struct chimera_vfs_claim *claim,
+    void                     *private_data)
+{
+    int *count = private_data;
+
+    assert(claim->file == NULL);
+    assert(claim->range_node.left == NULL);
+    (*count)++;
+} /* range_release_count */
+
+static void
+test_range_carve_claim_count_boundaries(void)
+{
+    enum { MAX_CLAIM_COUNT = 100 };
+    const int                      claim_counts[] = { 63, 64, 65, 100 };
+    struct chimera_vfs_state      *state          = chimera_vfs_state_init();
+    struct chimera_vfs_file_state *file           = get_file(state, 1);
+    struct chimera_vfs_claim      *claims         = calloc(MAX_CLAIM_COUNT,
+                                                           sizeof(*claims));
+    struct chimera_claim_owner     owner;
+    int                            case_index;
+    int                            i;
+
+    fprintf(stderr, "\ntest_range_carve_claim_count_boundaries\n");
+    assert(claims != NULL);
+    init_owner(&owner, CHIMERA_CLAIM_PROTO_NLM, 0xA, 1);
+    for (case_index = 0;
+         case_index < (int) (sizeof(claim_counts) / sizeof(claim_counts[0]));
+         case_index++) {
+        int claim_count = claim_counts[case_index];
+        int released    = 0;
+
+        for (i = 0; i < claim_count; i++) {
+            chimera_vfs_claim_init_range(&claims[i], true, false, i * 2, 200,
+                                         &owner);
+            assert(chimera_vfs_claim_try_acquire(state, file, &claims[i], NULL)
+                   == CHIMERA_CLAIM_GRANTED);
+        }
+
+        chimera_vfs_claim_range_replace(state, file, &owner, NULL, 0, 1000, 0,
+                                        NULL, 0, NULL, range_release_count,
+                                        &released);
+        CHECK(released == claim_count && interval_tree_empty(&file->range_tree),
+              "range carve releases every matching claim at count boundary");
+    }
+
+    chimera_vfs_state_put(state, file);
+    chimera_vfs_state_destroy(state);
+    free(claims);
+} /* test_range_carve_claim_count_boundaries */
+
 /* Test 6: share-mode conflict — same matrix as SMB sharemode --------- */
 static void
 test_share_vs_share(void)
@@ -966,8 +1231,8 @@ test_lease_test(void)
           "test names the holder by value");
 
     /* Probe is NOT inserted — file should still have only one claim. */
-    CHECK(file->claims[CHIMERA_CLAIM_CLASS_RANGE] == &held &&
-          held.next == NULL,
+    CHECK(interval_tree_find_overlap(&file->range_tree, 0, 99) ==
+          &held.range_node,
           "test does not insert the probe");
 
     chimera_vfs_claim_release(state, file, &held);
@@ -1850,6 +2115,10 @@ main(
     test_range_same_owner_coalesces();
     test_range_to_eof();
     test_range_zero_length();
+    test_range_tree_randomized_differential();
+    test_range_tree_carve_and_scan();
+    test_range_tree_mandatory_io();
+    test_range_carve_claim_count_boundaries();
     test_share_vs_share();
     test_caching_lease_basics();
     test_caching_w_breaks_r();

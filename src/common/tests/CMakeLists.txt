@@ -8,6 +8,14 @@ add_test(chimera/common/rbtree_test rbtree_test)
 
 set(CHIMERA_TEST_TIER quick)
 
+add_executable(interval_tree_test interval_tree_test.c)
+if(MSVC)
+    target_compile_options(interval_tree_test PRIVATE /UNDEBUG)
+else()
+    target_compile_options(interval_tree_test PRIVATE -UNDEBUG)
+endif()
+add_test(NAME chimera/common/interval_tree COMMAND interval_tree_test)
+
 if(NOT URCU_ENABLED)
     add_executable(rcu_test rcu_test.c)
     target_link_libraries(rcu_test chimera_common)

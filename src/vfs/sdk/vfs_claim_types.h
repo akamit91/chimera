@@ -90,6 +90,25 @@ chimera_vfs_claim_range_overlap_i(
     return before_b_end && before_a_end;
 } /* chimera_vfs_claim_range_overlap_i */
 
+/* Inclusive candidate envelope for the interval index.  The overlap helper
+* above remains authoritative for zero-length and other claim semantics. */
+static inline void
+chimera_vfs_claim_range_bounds_i(
+    uint64_t  offset,
+    uint64_t  length,
+    uint64_t *start_out,
+    uint64_t *end_out)
+{
+    *start_out = offset;
+    if (length == 0) {
+        *end_out = offset;
+    } else if (length == UINT64_MAX || length - 1 > UINT64_MAX - offset) {
+        *end_out = UINT64_MAX;
+    } else {
+        *end_out = offset + length - 1;
+    }
+} /* chimera_vfs_claim_range_bounds_i */
+
 /* Backend claim wire shapes (CHIMERA_VFS_OP_CLAIM_ACQUIRE/_RELEASE): the
  * revocable per-node AGGREGATE token vs a binding per-owner RANGE record. */
 #define CHIMERA_VFS_CLAIM_KLASS_AGGREGATE 1

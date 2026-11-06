@@ -96,6 +96,12 @@ chimera_vfs_state_shard_for(
     return &state->shards[(fh_hash >> 32) & (CHIMERA_VFS_STATE_NUM_SHARDS - 1)];
 } /* chimera_vfs_state_shard_for */
 
+static inline struct chimera_vfs_claim *
+chimera_vfs_claim_from_range_node(struct interval_tree_node *node)
+{
+    return container_of(node, struct chimera_vfs_claim, range_node);
+} /* chimera_vfs_claim_from_range_node */
+
 static inline struct chimera_vfs_file_state **
 chimera_vfs_state_slot_for(
     struct chimera_vfs_state_shard *shard,
@@ -199,6 +205,7 @@ chimera_vfs_state_get(
     file->refcount = 1;
     file->state    = state;
     evpl_mutex_init(&file->lock, NULL);
+    interval_tree_init(&file->range_tree);
 
     slot              = chimera_vfs_state_slot_for(shard, fh_hash);
     file->bucket_next = *slot;
@@ -238,7 +245,9 @@ chimera_vfs_state_put(
     /* Tear down only when no claims remain (a claim is an implicit ref). */
     empty = true;
     for (k = 0; k < CHIMERA_CLAIM_CLASS_COUNT; k++) {
-        if (file->claims[k]) {
+        if ((k == CHIMERA_CLAIM_CLASS_RANGE &&
+             !interval_tree_empty(&file->range_tree)) ||
+            (k != CHIMERA_CLAIM_CLASS_RANGE && file->claims[k])) {
             empty = false;
             break;
         }
@@ -1103,16 +1112,92 @@ chimera_vfs_claim_sole_opener_blocker_locked(
     return NULL;
 } /* chimera_vfs_claim_sole_opener_blocker_locked */
 
+struct chimera_vfs_claim_admit_ctx {
+    struct chimera_vfs_file_state  *file;
+    const struct chimera_vfs_claim *probe;
+    struct chimera_vfs_claim       *idle_break;
+    struct chimera_vfs_claim       *expired_break;
+    struct chimera_vfs_claim       *waiting_on;
+    struct chimera_vfs_claim       *denied_by;
+};
+
+static bool
+chimera_vfs_claim_admit_candidate(
+    struct chimera_vfs_claim           *cur,
+    struct chimera_vfs_claim_admit_ctx *ctx)
+{
+    if (!chimera_vfs_claim_conflicts(cur, ctx->probe)) {
+        return true;
+    }
+
+    if (chimera_vfs_claim_revocable(cur)) {
+        if (cur->break_state == CHIMERA_CLAIM_BREAK_IDLE ||
+            cur->break_state == CHIMERA_CLAIM_BREAK_ACKED) {
+            if (!ctx->idle_break) {
+                ctx->idle_break = cur;
+            }
+        } else if (cur->break_state == CHIMERA_CLAIM_BREAK_BREAKING) {
+            if (chimera_vfs_claim_deadline_passed(cur)) {
+                if (!ctx->expired_break) {
+                    ctx->expired_break = cur;
+                }
+            } else if (!ctx->waiting_on) {
+                ctx->waiting_on = cur;
+            }
+        }
+        /* REVOKED contributes nothing and never conflicts. */
+        return true;
+    }
+
+    /* Hard (binding) conflict.  ACCESS conflicts may escape onto the
+     * blocker's revocable H cache (R8). */
+    {
+        struct chimera_vfs_claim *escape =
+            chimera_vfs_claim_batch_escape(ctx->file, cur, ctx->probe);
+
+        if (escape) {
+            if (escape->break_state == CHIMERA_CLAIM_BREAK_IDLE) {
+                if (!ctx->idle_break) {
+                    ctx->idle_break = escape;
+                }
+            } else if (chimera_vfs_claim_deadline_passed(escape)) {
+                if (!ctx->expired_break) {
+                    ctx->expired_break = escape;
+                }
+            } else if (!ctx->waiting_on) {
+                ctx->waiting_on = escape;
+            }
+            return true;
+        }
+    }
+
+    ctx->denied_by = cur;
+    return false;
+} /* chimera_vfs_claim_admit_candidate */
+
+static bool
+chimera_vfs_claim_admit_range_visit(
+    struct interval_tree_node *node,
+    void                      *private_data)
+{
+    struct chimera_vfs_claim_admit_ctx *ctx = private_data;
+
+    return chimera_vfs_claim_admit_candidate(
+        chimera_vfs_claim_from_range_node(node), ctx);
+} /* chimera_vfs_claim_admit_range_visit */
+
 enum chimera_vfs_claim_result
 chimera_vfs_claim_admit_locked(
     struct chimera_vfs_file_state  *file,
     const struct chimera_vfs_claim *probe,
     struct chimera_vfs_claim      **conflict_claim)
 {
-    struct chimera_vfs_claim *cur;
-    struct chimera_vfs_claim *idle_break    = NULL;
-    struct chimera_vfs_claim *expired_break = NULL;
-    struct chimera_vfs_claim *waiting_on    = NULL;
+    struct chimera_vfs_claim_admit_ctx ctx = {
+        .file  = file,
+        .probe = probe,
+    };
+    struct chimera_vfs_claim          *cur;
+    uint64_t range_start, range_end;
     int k;
 
     if (conflict_claim) {
@@ -1126,54 +1211,23 @@ chimera_vfs_claim_admit_locked(
     }
 
     for (k = 0; k < CHIMERA_CLAIM_CLASS_COUNT; k++) {
-        for (cur = file->claims[k]; cur; cur = cur->next) {
-            if (!chimera_vfs_claim_conflicts(cur, probe)) {
-                continue;
-            }
-
-            if (chimera_vfs_claim_revocable(cur)) {
-                if (cur->break_state == CHIMERA_CLAIM_BREAK_IDLE ||
-                    cur->break_state == CHIMERA_CLAIM_BREAK_ACKED) {
-                    if (!idle_break) {
-                        idle_break = cur;
-                    }
-                } else if (cur->break_state == CHIMERA_CLAIM_BREAK_BREAKING) {
-                    if (chimera_vfs_claim_deadline_passed(cur)) {
-                        if (!expired_break) {
-                            expired_break = cur;
-                        }
-                    } else if (!waiting_on) {
-                        waiting_on = cur;
-                    }
-                }
-                /* REVOKED contributes nothing and never conflicts. */
-                continue;
-            }
-
-            /* Hard (binding) conflict.  ACCESS conflicts may escape onto
-             * the blocker's revocable H cache (R8). */
-            {
-                struct chimera_vfs_claim *escape =
-                    chimera_vfs_claim_batch_escape(file, cur, probe);
-
-                if (escape) {
-                    if (escape->break_state == CHIMERA_CLAIM_BREAK_IDLE) {
-                        if (!idle_break) {
-                            idle_break = escape;
-                        }
-                    } else if (chimera_vfs_claim_deadline_passed(escape)) {
-                        if (!expired_break) {
-                            expired_break = escape;
-                        }
-                    } else if (!waiting_on) {
-                        waiting_on = escape;
-                    }
-                    continue;
+        if (k == CHIMERA_CLAIM_CLASS_RANGE) {
+            chimera_vfs_claim_range_bounds_i(probe->offset, probe->length,
+                                             &range_start, &range_end);
+            interval_tree_visit_overlaps(&file->range_tree,
+                                         range_start, range_end,
+                                         chimera_vfs_claim_admit_range_visit,
+                                         &ctx);
+        } else {
+            for (cur = file->claims[k]; cur; cur = cur->next) {
+                if (!chimera_vfs_claim_admit_candidate(cur, &ctx)) {
+                    break;
                 }
             }
-
+        }
+        if (ctx.denied_by) {
             if (conflict_claim) {
-                *conflict_claim = cur;
+                *conflict_claim = ctx.denied_by;
             }
             return CHIMERA_CLAIM_DENIED;
         }
@@ -1196,10 +1250,10 @@ chimera_vfs_claim_admit_locked(
         }
     }
 
-    if (idle_break || expired_break || waiting_on) {
+    if (ctx.idle_break || ctx.expired_break || ctx.waiting_on) {
         if (conflict_claim) {
-            *conflict_claim = idle_break ? idle_break
-                : (expired_break ? expired_break : waiting_on);
+            *conflict_claim = ctx.idle_break ? ctx.idle_break
+                : (ctx.expired_break ? ctx.expired_break : ctx.waiting_on);
         }
         return CHIMERA_CLAIM_BREAKING;
     }
@@ -1290,7 +1344,7 @@ chimera_vfs_claim_contended_floor(
 } /* chimera_vfs_claim_contended_floor */
 
 /* -------------------------------------------------------------------- */
-/* List linkage                                                         */
+/* Claim indexing                                                       */
 /* -------------------------------------------------------------------- */
 
 void
@@ -1298,9 +1352,26 @@ chimera_vfs_claim_link_locked(
     struct chimera_vfs_file_state *file,
     struct chimera_vfs_claim      *claim)
 {
-    struct chimera_vfs_claim **head = &file->claims[claim->klass];
+    struct chimera_vfs_claim **head;
 
     claim->file = file;
+    if (claim->klass == CHIMERA_CLAIM_CLASS_RANGE) {
+        uint64_t start, end;
+
+        chimera_vfs_claim_range_bounds_i(claim->offset, claim->length,
+                                         &start, &end);
+        chimera_vfs_abort_if(!interval_tree_node_init(&claim->range_node,
+                                                      start, end),
+                             "range claim has inverted interval");
+        chimera_vfs_abort_if(!interval_tree_insert(&file->range_tree,
+                                                   &claim->range_node),
+                             "range claim already indexed");
+        claim->prev = NULL;
+        claim->next = NULL;
+        return;
+    }
+
+    head        = &file->claims[claim->klass];
     claim->prev = NULL;
     claim->next = *head;
     if (*head) {
@@ -1314,8 +1385,15 @@ chimera_vfs_claim_unlink_locked(
     struct chimera_vfs_file_state *file,
     struct chimera_vfs_claim      *claim)
 {
-    struct chimera_vfs_claim **head = &file->claims[claim->klass];
+    struct chimera_vfs_claim **head;
 
+    if (claim->klass == CHIMERA_CLAIM_CLASS_RANGE) {
+        interval_tree_remove(&file->range_tree, &claim->range_node);
+        claim->file = NULL;
+        return;
+    }
+
+    head = &file->claims[claim->klass];
     if (claim->prev) {
         claim->prev->next = claim->next;
     } else if (*head == claim) {
@@ -1899,6 +1977,33 @@ chimera_vfs_claim_test(
     return result;
 } /* chimera_vfs_claim_test */
 
+struct chimera_vfs_claim_range_owner_ctx {
+    const struct chimera_claim_owner *owner;
+    const struct chimera_vfs_claim   *except;
+    uint64_t                          offset;
+    uint64_t                          length;
+    bool                              held;
+};
+
+static bool
+chimera_vfs_claim_range_owner_visit(
+    struct interval_tree_node *node,
+    void                      *private_data)
+{
+    struct chimera_vfs_claim_range_owner_ctx *ctx = private_data;
+    struct chimera_vfs_claim                 *cur =
+        chimera_vfs_claim_from_range_node(node);
+
+    if (cur != ctx->except &&
+        chimera_claim_owner_equal(&cur->owner, ctx->owner) &&
+        chimera_vfs_claim_range_overlap(cur->offset, cur->length,
+                                        ctx->offset, ctx->length)) {
+        ctx->held = true;
+        return false;
+    }
+    return true;
+} /* chimera_vfs_claim_range_owner_visit */
+
 SYMBOL_EXPORT bool
 chimera_vfs_claim_range_owner_holds(
     struct chimera_vfs_file_state    *file,
@@ -1907,23 +2012,21 @@ chimera_vfs_claim_range_owner_holds(
     uint64_t                          offset,
     uint64_t                          length)
 {
-    struct chimera_vfs_claim *cur;
-    bool                      held = false;
+    struct chimera_vfs_claim_range_owner_ctx ctx = {
+        .owner  = owner,
+        .except = except,
+        .offset = offset,
+        .length = length,
+    };
+    uint64_t                                 start, end;
 
     evpl_mutex_lock(&file->lock);
-    for (cur = file->claims[CHIMERA_CLAIM_CLASS_RANGE]; cur; cur = cur->next) {
-        if (cur == except ||
-            !chimera_claim_owner_equal(&cur->owner, owner) ||
-            !chimera_vfs_claim_range_overlap(cur->offset, cur->length,
-                                             offset, length)) {
-            continue;
-        }
-        held = true;
-        break;
-    }
+    chimera_vfs_claim_range_bounds_i(offset, length, &start, &end);
+    interval_tree_visit_overlaps(&file->range_tree, start, end,
+                                 chimera_vfs_claim_range_owner_visit, &ctx);
     evpl_mutex_unlock(&file->lock);
 
-    return held;
+    return ctx.held;
 } /* chimera_vfs_claim_range_owner_holds */
 
 SYMBOL_EXPORT bool
@@ -1987,49 +2090,59 @@ chimera_vfs_claim_range_replace_common(
     void                             *released_arg,
     bool                              pump)
 {
-    struct chimera_vfs_claim *cur, *next;
-    struct chimera_vfs_claim *released[CHIMERA_VFS_CLAIM_MAX_BREAK_BATCH];
-    int                       n_released = 0;
-    int                       n_spare    = 0;
-    int                       i;
+    struct interval_tree_node *node, *next_node;
+    struct chimera_vfs_claim  *cur;
+    struct chimera_vfs_claim  *released_head = NULL;
+    struct chimera_vfs_claim **released_tail = &released_head;
+    struct chimera_vfs_claim  *released_cur, *released_next;
+    uint64_t                   query_start, query_end;
+    int                        n_spare = 0;
 
     /* v1 supports the carve (unlock/split) only; inserting the replacement
      * extent is the caller's subsequent acquire.  new_mask is reserved. */
     chimera_vfs_abort_if(new_mask != 0,
                          "range_replace: new_mask insertion not yet supported");
 
+    chimera_vfs_claim_range_bounds_i(offset, length,
+                                     &query_start, &query_end);
     evpl_mutex_lock(&file->lock);
 
-    for (cur = file->claims[CHIMERA_CLAIM_CLASS_RANGE]; cur; cur = next) {
-        next = cur->next;
+    node = interval_tree_first_overlap(&file->range_tree,
+                                       query_start, query_end);
+    while (node && node->start <= query_end) {
+        uint64_t cur_end_exclusive;
+        bool     cur_reaches_eof;
+        bool     carve_reaches_eof;
 
-        if (cur == except) {
-            continue;
-        }
-        if (!chimera_claim_owner_equal(&cur->owner, owner)) {
-            continue;
-        }
-        if (!chimera_vfs_claim_range_overlap(cur->offset, cur->length,
-                                             offset, length)) {
-            continue;
-        }
+        /* Mutations may rotate the tree.  Save this original node's
+         * successor before inserting remainders or unlinking the claim. */
+        next_node = interval_tree_next(&file->range_tree, node);
+        cur       = chimera_vfs_claim_from_range_node(node);
 
-        /* Compute left/right remainders of `cur` outside [offset, end). */
-        {
-            uint64_t cur_off          = cur->offset;
-            uint64_t cur_len          = cur->length;
-            bool     has_left         = cur_off < offset;
-            uint64_t carve_end_is_eof = (length == UINT64_MAX);
-            uint64_t carve_end        = carve_end_is_eof ? UINT64_MAX
-                : offset + length;
+        if (cur != except && chimera_claim_owner_equal(&cur->owner, owner) &&
+            chimera_vfs_claim_range_overlap(cur->offset, cur->length,
+                                            offset, length)) {
+            /* Compute left/right remainders of `cur` outside [offset, end). */
+            uint64_t cur_off  = cur->offset;
+            uint64_t cur_len  = cur->length;
+            bool     has_left = cur_off < offset;
+            uint64_t carve_end;
             bool     has_right;
 
-            if (carve_end_is_eof) {
+            carve_reaches_eof = length == UINT64_MAX ||
+                (length != 0 && length > UINT64_MAX - offset);
+            carve_end       = carve_reaches_eof ? UINT64_MAX : offset + length;
+            cur_reaches_eof = cur_len == UINT64_MAX ||
+                (cur_len != 0 && cur_len > UINT64_MAX - cur_off);
+            cur_end_exclusive = cur_reaches_eof ? UINT64_MAX
+                : cur_off + cur_len;
+
+            if (carve_reaches_eof) {
                 has_right = false;
-            } else if (cur_len == UINT64_MAX) {
+            } else if (cur_reaches_eof) {
                 has_right = true;
             } else {
-                has_right = (cur_off + cur_len) > carve_end;
+                has_right = cur_end_exclusive > carve_end;
             }
 
             /* A remainder is a NEW claim with the carved geometry, not the
@@ -2056,39 +2169,40 @@ chimera_vfs_claim_range_replace_common(
 
                 *right        = *cur;
                 right->offset = carve_end;
-                right->length = (cur_len == UINT64_MAX) ? UINT64_MAX
-                    : (cur_off + cur_len) - carve_end;
+                right->length = cur_reaches_eof ? UINT64_MAX
+                    : cur_end_exclusive - carve_end;
                 right->backend_token = 0;
                 right->prev          = NULL;
                 right->next          = NULL;
                 chimera_vfs_claim_link_locked(file, right);
             }
+            chimera_vfs_claim_unlink_locked(file, cur);
+            cur->next      = NULL;
+            *released_tail = cur;
+            released_tail  = &cur->next;
         }
 
-        chimera_vfs_claim_unlink_locked(file, cur);
-        if (n_released < CHIMERA_VFS_CLAIM_MAX_BREAK_BATCH) {
-            released[n_released++] = cur;
-        }
+        node = next_node;
     }
 
     evpl_mutex_unlock(&file->lock);
 
-    for (i = 0; i < n_released; i++) {
-        if (released[i]->backend_token) {
+    for (released_cur = released_head; released_cur;
+         released_cur = released_next) {
+        released_next      = released_cur->next;
+        released_cur->next = NULL;
+        if (released_cur->backend_token) {
             chimera_vfs_claim_backend_release_token(
-                state, file, released[i]->backend_token);
-            released[i]->backend_token = 0;
+                state, file, released_cur->backend_token);
+            released_cur->backend_token = 0;
+        }
+        if (released_cb) {
+            released_cb(released_cur, released_arg);
         }
     }
 
     if (spare_used) {
         *spare_used = n_spare;
-    }
-
-    for (i = 0; i < n_released; i++) {
-        if (released_cb) {
-            released_cb(released[i], released_arg);
-        }
     }
 
     if (pump) {
@@ -2479,6 +2593,34 @@ chimera_vfs_claim_client_holds_cache(
 /* Scan                                                                 */
 /* -------------------------------------------------------------------- */
 
+static void
+chimera_vfs_claim_scan_one(
+    const struct chimera_vfs_claim        *claim,
+    const struct chimera_vfs_claim_filter *filter,
+    chimera_vfs_claim_visit_cb_t           visit_cb,
+    void                                  *arg)
+{
+    if (filter->used_any && !(claim->used & filter->used_any)) {
+        return;
+    }
+    if (filter->proto && claim->owner.proto != filter->proto) {
+        return;
+    }
+    if (filter->exclude_client &&
+        claim->owner.client_key == filter->exclude_client) {
+        return;
+    }
+    if (filter->breaking_only &&
+        claim->break_state != CHIMERA_CLAIM_BREAK_BREAKING) {
+        return;
+    }
+    if (!filter->include_inert &&
+        claim->construct == CHIMERA_CONSTRUCT_SMB_OPEN_INERT) {
+        return;
+    }
+    visit_cb(claim, arg);
+} /* chimera_vfs_claim_scan_one */
+
 SYMBOL_EXPORT void
 chimera_vfs_claim_scan(
     struct chimera_vfs_file_state         *file,
@@ -2487,6 +2629,7 @@ chimera_vfs_claim_scan(
     void                                  *arg)
 {
     const struct chimera_vfs_claim *cur;
+    struct interval_tree_node      *node;
     int                             k;
 
     evpl_mutex_lock(&file->lock);
@@ -2494,26 +2637,17 @@ chimera_vfs_claim_scan(
         if (filter->klass_mask && !(filter->klass_mask & (1u << k))) {
             continue;
         }
-        for (cur = file->claims[k]; cur; cur = cur->next) {
-            if (filter->used_any && !(cur->used & filter->used_any)) {
-                continue;
+        if (k == CHIMERA_CLAIM_CLASS_RANGE) {
+            for (node = interval_tree_first(&file->range_tree);
+                 node;
+                 node = interval_tree_next(&file->range_tree, node)) {
+                cur = chimera_vfs_claim_from_range_node(node);
+                chimera_vfs_claim_scan_one(cur, filter, visit_cb, arg);
             }
-            if (filter->proto && cur->owner.proto != filter->proto) {
-                continue;
+        } else {
+            for (cur = file->claims[k]; cur; cur = cur->next) {
+                chimera_vfs_claim_scan_one(cur, filter, visit_cb, arg);
             }
-            if (filter->exclude_client &&
-                cur->owner.client_key == filter->exclude_client) {
-                continue;
-            }
-            if (filter->breaking_only &&
-                cur->break_state != CHIMERA_CLAIM_BREAK_BREAKING) {
-                continue;
-            }
-            if (!filter->include_inert &&
-                cur->construct == CHIMERA_CONSTRUCT_SMB_OPEN_INERT) {
-                continue;
-            }
-            visit_cb(cur, arg);
         }
     }
     evpl_mutex_unlock(&file->lock);

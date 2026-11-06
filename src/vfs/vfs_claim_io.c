@@ -789,6 +789,49 @@ chimera_vfs_io_claim_release(struct chimera_vfs_request *request)
 /* Mandatory-lock I/O predicate                                         */
 /* -------------------------------------------------------------------- */
 
+struct chimera_vfs_claim_io_ctx {
+    uint64_t                          offset;
+    uint64_t                          length;
+    bool                              is_write;
+    const struct chimera_claim_actor *actor;
+    bool                              conflict;
+};
+
+static bool
+chimera_vfs_claim_io_visit(
+    struct interval_tree_node *node,
+    void                      *private_data)
+{
+    struct chimera_vfs_claim_io_ctx *ctx   = private_data;
+    struct chimera_vfs_claim        *claim =
+        container_of(node, struct chimera_vfs_claim, range_node);
+
+    if (claim->break_state == CHIMERA_CLAIM_BREAK_REVOKED ||
+        !chimera_vfs_claim_range_overlap(claim->offset, claim->length,
+                                         ctx->offset, ctx->length)) {
+        return true;
+    }
+    if (claim->used & CHIMERA_CLAIM_LW) {
+        /* Exclusive lock: blocks all I/O from other actors; the lock's own
+         * actor (owner, lease key, or handle) passes. */
+        bool self = ctx->actor &&
+            (chimera_claim_owner_equal(&claim->owner, &ctx->actor->owner) ||
+             chimera_claim_owner_same_lease(&claim->owner, &ctx->actor->owner) ||
+             (ctx->actor->op_handle &&
+              claim->op_handle == ctx->actor->op_handle));
+
+        if (!self) {
+            ctx->conflict = true;
+            return false;
+        }
+    } else if (ctx->is_write) {
+        /* Shared lock: denies writes GLOBALLY, its own owner included. */
+        ctx->conflict = true;
+        return false;
+    }
+    return true;
+} /* chimera_vfs_claim_io_visit */
+
 SYMBOL_EXPORT bool
 chimera_vfs_claim_io_denied(
     struct chimera_vfs_state         *state,
@@ -800,9 +843,14 @@ chimera_vfs_claim_io_denied(
     bool                              is_write,
     const struct chimera_claim_actor *actor)
 {
-    struct chimera_vfs_file_state *file;
-    struct chimera_vfs_claim      *cur;
-    bool                           conflict = false;
+    struct chimera_vfs_file_state  *file;
+    struct chimera_vfs_claim_io_ctx ctx = {
+        .offset   = offset,
+        .length   = length,
+        .is_write = is_write,
+        .actor    = actor,
+    };
+    uint64_t                        start, end;
 
     /* Zero-length reads are exempt (R25's carve-out, owned here). */
     if (!is_write && length == 0) {
@@ -815,40 +863,13 @@ chimera_vfs_claim_io_denied(
     }
 
     evpl_mutex_lock(&file->lock);
-    for (cur = file->claims[CHIMERA_CLAIM_CLASS_RANGE]; cur; cur = cur->next) {
-        if (cur->break_state == CHIMERA_CLAIM_BREAK_REVOKED) {
-            continue;
-        }
-        if (!chimera_vfs_claim_range_overlap(cur->offset, cur->length,
-                                             offset, length)) {
-            continue;
-        }
-        if (cur->used & CHIMERA_CLAIM_LW) {
-            /* Exclusive lock: blocks all I/O from other actors; the lock's
-             * own actor (owner, its grant's lease key, or its very handle
-             * -- the HOLDER-exempt MAND row) passes. */
-            bool self = actor &&
-                (chimera_claim_owner_equal(&cur->owner, &actor->owner) ||
-                 chimera_claim_owner_same_lease(&cur->owner, &actor->owner) ||
-                 (actor->op_handle && cur->op_handle == actor->op_handle));
-
-            if (!self) {
-                conflict = true;
-                break;
-            }
-        } else {
-            /* Shared lock: denies writes GLOBALLY, its own owner included
-             * (MS-FSA). */
-            if (is_write) {
-                conflict = true;
-                break;
-            }
-        }
-    }
+    chimera_vfs_claim_range_bounds_i(offset, length, &start, &end);
+    interval_tree_visit_overlaps(&file->range_tree, start, end,
+                                 chimera_vfs_claim_io_visit, &ctx);
     evpl_mutex_unlock(&file->lock);
 
     chimera_vfs_state_put(state, file);
-    return conflict;
+    return ctx.conflict;
 } /* chimera_vfs_claim_io_denied */
 
 /* -------------------------------------------------------------------- */

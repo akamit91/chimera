@@ -23,9 +23,8 @@ struct chimera_vfs_request;
  * One in-memory anchor per file handle (chimera_vfs_file_state -- the name
  * and lifecycle survive from the previous lease core so the open-handle
  * cache's CAS attach and every state_get/put call site keep their shape).
- * The anchor holds three claim class lists (access / cache / range) walked
- * by the admission predicate, the trigger engine, and the mandatory-lock
- * I/O predicate.
+ * The anchor holds ACCESS/CACHE claim lists and a RANGE interval tree, used
+ * by the admission predicate, trigger engine, and mandatory-lock I/O check.
  *
  * SYNC CONTRACT (local arbiter): every verb completes synchronously.
  * chimera_vfs_claim_acquire fires its callback inside the call for GRANTED
@@ -53,8 +52,10 @@ struct chimera_vfs_file_state {
     uint64_t                            fh_hash;
     evpl_mutex_t                        lock;
 
-    /* Claim class lists (all guarded by file->lock). */
+    /* ACCESS/CACHE claim lists (guarded by file->lock). RANGE claims are
+     * indexed only by range_tree. */
     struct chimera_vfs_claim           *claims[CHIMERA_CLAIM_CLASS_COUNT];
+    struct interval_tree                range_tree;
 
     /* Owner/key-indexed cache grants on this file; each grant's embedded
      * claim is also on claims[CACHE]. */

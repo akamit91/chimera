@@ -8,6 +8,8 @@
 #include <stdbool.h>
 #include <string.h>
 
+#include "common/interval_tree.h"
+
 /*
  * Unified VFS claim vocabulary (the "two-table claim core").
  *
@@ -85,8 +87,8 @@ enum chimera_claim_construct {
     CHIMERA_CONSTRUCT_COUNT
 };
 
-/* Storage class: which per-file list a claim lives on.  Purely an indexing
- * concern (walk efficiency, the MAND fast path); carries no semantics. */
+/* Storage class: per-file claim index. ACCESS/CACHE use lists and RANGE uses
+ * the interval tree. Purely indexing; carries no semantics. */
 enum chimera_claim_class {
     CHIMERA_CLAIM_CLASS_ACCESS = 0, /* share reservations, deny probes      */
     CHIMERA_CLAIM_CLASS_CACHE  = 1, /* leases, oplocks, delegations, impl.  */
@@ -157,6 +159,7 @@ struct chimera_vfs_claim {
     uint64_t                        offset;     /* RANGE only; others 0     */
     uint64_t                        length;     /* UINT64_MAX = to-EOF,
                                                  * 0 = genuine zero-byte    */
+    struct interval_tree_node       range_node; /* RANGE index; detached otherwise */
 
     struct chimera_claim_owner      owner;
     struct chimera_vfs_open_handle *op_handle;  /* HOLDER-circle anchor for
@@ -202,7 +205,7 @@ struct chimera_vfs_claim {
 
     struct chimera_vfs_file_state  *file;
 
-    /* Intrusive linkage on the per-file class list. */
+    /* Intrusive linkage on ACCESS/CACHE class lists. */
     struct chimera_vfs_claim       *prev;
     struct chimera_vfs_claim       *next;
 };
