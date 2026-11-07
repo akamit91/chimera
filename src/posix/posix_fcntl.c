@@ -378,8 +378,12 @@ chimera_posix_fcntl(
         /* Carve the owner's local coverage of the range (REPLACE geometry)
          * and wait for the backend to drop what it held, so the range is
          * free to every other process by the time this call returns. */
-        chimera_posix_lock_claim_unlock(posix, entry->ofd, handle,
-                                        offset, core_length);
+        if (!chimera_posix_lock_claim_unlock(posix, entry->ofd, handle,
+                                             offset, core_length)) {
+            chimera_posix_fd_release(entry, 0);
+            errno = ENOMEM;
+            return -1;
+        }
     }
 
     if (local_arbiter && cmd != F_GETLK &&
@@ -422,8 +426,13 @@ chimera_posix_fcntl(
          * fragments in place looked harmless -- it is not: a stale WRITE
          * fragment under a downgraded range still denies another owner's
          * READ lock, and under F_SETLKW that waits forever. */
-        chimera_posix_ofd_lock_replace(posix, entry->ofd, handle, node,
-                                       offset, core_length);
+        if (!chimera_posix_ofd_lock_replace(posix, entry->ofd, handle, node,
+                                            offset, core_length)) {
+            chimera_posix_ofd_lock_untrack_release(posix, node);
+            chimera_posix_fd_release(entry, 0);
+            errno = ENOMEM;
+            return -1;
+        }
     }
 
     chimera_posix_fd_release(entry, 0);

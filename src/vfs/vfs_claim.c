@@ -1354,7 +1354,8 @@ chimera_vfs_claim_link_locked(
 {
     struct chimera_vfs_claim **head;
 
-    claim->file = file;
+    chimera_vfs_abort_if(claim->file != NULL,
+                         "claim already linked into a file");
     if (claim->klass == CHIMERA_CLAIM_CLASS_RANGE) {
         uint64_t start, end;
 
@@ -1366,11 +1367,13 @@ chimera_vfs_claim_link_locked(
         chimera_vfs_abort_if(!interval_tree_insert(&file->range_tree,
                                                    &claim->range_node),
                              "range claim already indexed");
+        claim->file = file;
         claim->prev = NULL;
         claim->next = NULL;
         return;
     }
 
+    claim->file = file;
     head        = &file->claims[claim->klass];
     claim->prev = NULL;
     claim->next = *head;
@@ -2072,7 +2075,39 @@ chimera_vfs_claim_cancel(
 /* REPLACE-geometry carve                                               */
 /* -------------------------------------------------------------------- */
 
-static void
+static int
+chimera_vfs_claim_range_remainder_count(
+    const struct chimera_vfs_claim *claim,
+    uint64_t                        offset,
+    uint64_t                        length)
+{
+    uint64_t cur_end_exclusive;
+    uint64_t carve_end;
+    bool     cur_reaches_eof;
+    bool     carve_reaches_eof;
+    bool     has_left;
+    bool     has_right;
+
+    has_left          = claim->offset < offset;
+    carve_reaches_eof = length == UINT64_MAX ||
+        (length != 0 && length > UINT64_MAX - offset);
+    carve_end       = carve_reaches_eof ? UINT64_MAX : offset + length;
+    cur_reaches_eof = claim->length == UINT64_MAX ||
+        (claim->length != 0 && claim->length > UINT64_MAX - claim->offset);
+    cur_end_exclusive = cur_reaches_eof ? UINT64_MAX
+        : claim->offset + claim->length;
+
+    if (carve_reaches_eof) {
+        has_right = false;
+    } else if (cur_reaches_eof) {
+        has_right = true;
+    } else {
+        has_right = cur_end_exclusive > carve_end;
+    }
+    return (int) has_left + (int) has_right;
+} /* chimera_vfs_claim_range_remainder_count */
+
+static bool
 chimera_vfs_claim_range_replace_common(
     struct chimera_vfs_state         *state,
     struct chimera_vfs_file_state    *file,
@@ -2090,13 +2125,15 @@ chimera_vfs_claim_range_replace_common(
     void                             *released_arg,
     bool                              pump)
 {
-    struct interval_tree_node *node, *next_node;
-    struct chimera_vfs_claim  *cur;
-    struct chimera_vfs_claim  *released_head = NULL;
-    struct chimera_vfs_claim **released_tail = &released_head;
-    struct chimera_vfs_claim  *released_cur, *released_next;
-    uint64_t                   query_start, query_end;
-    int                        n_spare = 0;
+    struct interval_tree_overlap_iterator iterator;
+    struct interval_tree_node            *node;
+    struct chimera_vfs_claim             *cur;
+    struct chimera_vfs_claim             *released_head = NULL;
+    struct chimera_vfs_claim            **released_tail = &released_head;
+    struct chimera_vfs_claim             *released_cur, *released_next;
+    uint64_t                              query_start, query_end;
+    int                                   n_spare         = 0;
+    int                                   required_spares = 0;
 
     /* v1 supports the carve (unlock/split) only; inserting the replacement
      * extent is the caller's subsequent acquire.  new_mask is reserved. */
@@ -2107,17 +2144,47 @@ chimera_vfs_claim_range_replace_common(
                                      &query_start, &query_end);
     evpl_mutex_lock(&file->lock);
 
-    node = interval_tree_first_overlap(&file->range_tree,
-                                       query_start, query_end);
-    while (node && node->start <= query_end) {
+    interval_tree_overlap_iterator_init(&file->range_tree, &iterator,
+                                        query_start, query_end);
+    while ((node = interval_tree_overlap_iterator_next(&file->range_tree,
+                                                       &iterator)) != NULL) {
+        cur = chimera_vfs_claim_from_range_node(node);
+        if (cur != except && chimera_claim_owner_equal(&cur->owner, owner) &&
+            chimera_vfs_claim_range_overlap(cur->offset, cur->length,
+                                            offset, length)) {
+            required_spares += chimera_vfs_claim_range_remainder_count(
+                cur, offset, length);
+        }
+    }
+
+    if (required_spares > n_spare_max ||
+        (required_spares > 0 && !spare)) {
+        if (spare_used) {
+            *spare_used = required_spares;
+        }
+        evpl_mutex_unlock(&file->lock);
+        return false;
+    }
+    for (n_spare = 0; n_spare < required_spares; n_spare++) {
+        if (!spare[n_spare] || spare[n_spare]->file != NULL) {
+            if (spare_used) {
+                *spare_used = required_spares;
+            }
+            evpl_mutex_unlock(&file->lock);
+            return false;
+        }
+    }
+    n_spare = 0;
+
+    interval_tree_overlap_iterator_init(&file->range_tree, &iterator,
+                                        query_start, query_end);
+    while ((node = interval_tree_overlap_iterator_next(&file->range_tree,
+                                                       &iterator)) != NULL) {
         uint64_t cur_end_exclusive;
         bool     cur_reaches_eof;
         bool     carve_reaches_eof;
 
-        /* Mutations may rotate the tree.  Save this original node's
-         * successor before inserting remainders or unlinking the claim. */
-        next_node = interval_tree_next(&file->range_tree, node);
-        cur       = chimera_vfs_claim_from_range_node(node);
+        cur = chimera_vfs_claim_from_range_node(node);
 
         if (cur != except && chimera_claim_owner_equal(&cur->owner, owner) &&
             chimera_vfs_claim_range_overlap(cur->offset, cur->length,
@@ -2160,6 +2227,7 @@ chimera_vfs_claim_range_replace_common(
                 left->offset        = cur_off;
                 left->length        = offset - cur_off;
                 left->backend_token = 0;
+                left->file          = NULL;
                 left->prev          = NULL;
                 left->next          = NULL;
                 chimera_vfs_claim_link_locked(file, left);
@@ -2172,6 +2240,7 @@ chimera_vfs_claim_range_replace_common(
                 right->length = cur_reaches_eof ? UINT64_MAX
                     : cur_end_exclusive - carve_end;
                 right->backend_token = 0;
+                right->file          = NULL;
                 right->prev          = NULL;
                 right->next          = NULL;
                 chimera_vfs_claim_link_locked(file, right);
@@ -2180,9 +2249,13 @@ chimera_vfs_claim_range_replace_common(
             cur->next      = NULL;
             *released_tail = cur;
             released_tail  = &cur->next;
-        }
 
-        node = next_node;
+            if (cur->backend_token) {
+                chimera_vfs_claim_backend_release_token(state, file,
+                                                        cur->backend_token);
+                cur->backend_token = 0;
+            }
+        }
     }
 
     evpl_mutex_unlock(&file->lock);
@@ -2191,11 +2264,6 @@ chimera_vfs_claim_range_replace_common(
          released_cur = released_next) {
         released_next      = released_cur->next;
         released_cur->next = NULL;
-        if (released_cur->backend_token) {
-            chimera_vfs_claim_backend_release_token(
-                state, file, released_cur->backend_token);
-            released_cur->backend_token = 0;
-        }
         if (released_cb) {
             released_cb(released_cur, released_arg);
         }
@@ -2208,9 +2276,10 @@ chimera_vfs_claim_range_replace_common(
     if (pump) {
         chimera_vfs_claim_pump(state, file);
     }
+    return true;
 } /* chimera_vfs_claim_range_replace_common */
 
-SYMBOL_EXPORT void
+SYMBOL_EXPORT bool
 chimera_vfs_claim_range_replace(
     struct chimera_vfs_state         *state,
     struct chimera_vfs_file_state    *file,
@@ -2227,13 +2296,12 @@ chimera_vfs_claim_range_replace(
         void                     *arg),
     void                             *released_arg)
 {
-    chimera_vfs_claim_range_replace_common(state, file, owner, except, offset,
-                                           length, new_mask, spare,
-                                           n_spare_max, spare_used,
-                                           released_cb, released_arg, true);
+    return chimera_vfs_claim_range_replace_common(
+        state, file, owner, except, offset, length, new_mask, spare,
+        n_spare_max, spare_used, released_cb, released_arg, true);
 } /* chimera_vfs_claim_range_replace */
 
-SYMBOL_EXPORT void
+SYMBOL_EXPORT bool
 chimera_vfs_claim_range_replace_nopump(
     struct chimera_vfs_state         *state,
     struct chimera_vfs_file_state    *file,
@@ -2250,10 +2318,9 @@ chimera_vfs_claim_range_replace_nopump(
         void                     *arg),
     void                             *released_arg)
 {
-    chimera_vfs_claim_range_replace_common(state, file, owner, except, offset,
-                                           length, new_mask, spare,
-                                           n_spare_max, spare_used,
-                                           released_cb, released_arg, false);
+    return chimera_vfs_claim_range_replace_common(
+        state, file, owner, except, offset, length, new_mask, spare,
+        n_spare_max, spare_used, released_cb, released_arg, false);
 } /* chimera_vfs_claim_range_replace_nopump */
 
 SYMBOL_EXPORT void

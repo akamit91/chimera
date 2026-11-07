@@ -7,6 +7,7 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 
 #include "common/interval_tree.h"
 #include "common/macros.h"
@@ -48,6 +49,9 @@ compare_intervals(
     }
     if (a->end != b->end) {
         return a->end < b->end ? -1 : 1;
+    }
+    if (a->sequence != b->sequence) {
+        return a->sequence < b->sequence ? -1 : 1;
     }
     return 0;
 } /* compare_intervals */
@@ -220,6 +224,12 @@ test_basic_queries_and_edges(void)
     active[0] = false;
     verify_tree(&tree, 7);
     verify_query(&tree, nodes, active, 8, 30, 30);
+    assert(interval_tree_insert(&tree, &nodes[0].node));
+    active[0] = true;
+    verify_tree(&tree, 8);
+    interval_tree_remove(&tree, &nodes[0].node);
+    active[0] = false;
+    verify_tree(&tree, 7);
 
     interval_tree_remove(&tree, &nodes[7].node);
     active[7] = false;
@@ -301,11 +311,63 @@ test_randomized_operations(void)
     verify_query(&tree, nodes, active, RANDOM_NODE_COUNT, 0, UINT64_MAX);
 } /* test_randomized_operations */
 
+static void
+test_overlap_iterator_prunes_and_survives_mutation(void)
+{
+    enum { NODE_COUNT = 10000 };
+    struct interval_tree                  tree;
+    struct interval_tree_overlap_iterator iterator;
+    struct test_interval                 *nodes = calloc(NODE_COUNT + 1,
+                                                         sizeof(*nodes));
+    struct interval_tree_node            *node;
+    struct test_interval                  duplicates[4] = { 0 };
+    size_t                                i;
+
+    assert(nodes != NULL);
+    interval_tree_init(&tree);
+    for (i = 0; i < NODE_COUNT; i++) {
+        nodes[i].id = i;
+        assert(interval_tree_node_init(&nodes[i].node, i * 4, i * 4 + 1));
+        assert(interval_tree_insert(&tree, &nodes[i].node));
+    }
+
+    interval_tree_overlap_iterator_init(&tree, &iterator,
+                                        NODE_COUNT * 2, NODE_COUNT * 2 + 1);
+    node = interval_tree_overlap_iterator_next(&tree, &iterator);
+    assert(node == &nodes[NODE_COUNT / 2].node);
+    assert(interval_tree_overlap_iterator_next(&tree, &iterator) == NULL);
+    assert(iterator.nodes_visited < 100);
+
+    interval_tree_init(&tree);
+    for (i = 0; i < 3; i++) {
+        assert(interval_tree_node_init(&duplicates[i].node, 0, 100));
+        assert(interval_tree_insert(&tree, &duplicates[i].node));
+    }
+    interval_tree_overlap_iterator_init(&tree, &iterator, 50, 50);
+    node = interval_tree_overlap_iterator_next(&tree, &iterator);
+    assert(node == &duplicates[0].node);
+    interval_tree_remove(&tree, node);
+    assert(interval_tree_node_init(&duplicates[3].node, 0, 100));
+    assert(interval_tree_insert(&tree, &duplicates[3].node));
+    assert(interval_tree_overlap_iterator_next(&tree, &iterator) ==
+           &duplicates[1].node);
+    assert(interval_tree_overlap_iterator_next(&tree, &iterator) ==
+           &duplicates[2].node);
+    assert(interval_tree_overlap_iterator_next(&tree, &iterator) == NULL);
+    verify_tree(&tree, 3);
+
+    for (i = 0; i < 3; i++) {
+        interval_tree_remove(&tree, &duplicates[i + 1].node);
+    }
+    free(nodes);
+} /* test_overlap_iterator_prunes_and_survives_mutation */
+
 int
 main(void)
 {
     test_basic_queries_and_edges();
     test_randomized_operations();
+    test_overlap_iterator_prunes_and_survives_mutation();
     printf("Interval tree tests passed.\n");
     return 0;
 } /* main */

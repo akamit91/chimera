@@ -255,7 +255,7 @@ void chimera_posix_ofd_lock_untrack_release(
  * rather than something this function derives: the unlock path runs it on a
  * worker thread, and the identity belongs to the application thread that
  * called fcntl(). */
-void chimera_posix_ofd_lock_carve(
+bool chimera_posix_ofd_lock_carve(
     struct chimera_posix_client      *posix,
     struct chimera_posix_ofd         *ofd,
     struct chimera_vfs_open_handle   *handle,
@@ -270,7 +270,7 @@ void chimera_posix_ofd_lock_carve(
  * and leaves `node` standing.  Doing it in this order rather than
  * carve-then-insert is what makes a refused upgrade leave the old lock
  * intact, and leaves no window in which the range is unheld. */
-void chimera_posix_ofd_lock_replace(
+bool chimera_posix_ofd_lock_replace(
     struct chimera_posix_client    *posix,
     struct chimera_posix_ofd       *ofd,
     struct chimera_vfs_open_handle *handle,
@@ -300,7 +300,7 @@ chimera_posix_ofd_track_token(
 
 /* F_UNLCK: carve the local coverage and wait for any backend releases it
 * produced to complete, so the range really is free when this returns. */
-void
+bool
 chimera_posix_lock_claim_unlock(
     struct chimera_posix_client    *posix,
     struct chimera_posix_ofd       *ofd,

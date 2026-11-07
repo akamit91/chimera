@@ -484,13 +484,16 @@ chimera_vfs_claim_cancel(
  * is the caller's subsequent acquire.  The core consumes fresh claim
  * structs from `spare` (caller-provided, n_spare of them: a claim that
  * straddles both edges of the range needs two) for split remainders and
- * hands released fragments back via the release callback.  Used by the
+ * hands released fragments back via the release callback.  Spares must be
+ * detached (their `file` field is NULL).  Returns false without changing any
+ * claims when the spare capacity is insufficient; in that case `spare_used`
+ * receives the required capacity.  Used by the
  * POSIX client (and later NFSv4 LOCKU); SMB stays exact-stack.
  *
  * `except`, when non-NULL, is left alone: it is how a re-lock expresses
  * POSIX's replace rule, having already inserted the new claim, without
  * carving the very claim it just took. */
-SYMBOL_EXPORT void
+SYMBOL_EXPORT bool
 chimera_vfs_claim_range_replace(
     struct chimera_vfs_state         *state,
     struct chimera_vfs_file_state    *file,
@@ -513,7 +516,7 @@ chimera_vfs_claim_range_replace(
  * remainders this carve handed it; a caller that keeps its own record of
  * the owner's claims (NLM's per-client lock list) records them first and
  * then pumps with chimera_vfs_claim_pump. */
-SYMBOL_EXPORT void
+SYMBOL_EXPORT bool
 chimera_vfs_claim_range_replace_nopump(
     struct chimera_vfs_state         *state,
     struct chimera_vfs_file_state    *file,

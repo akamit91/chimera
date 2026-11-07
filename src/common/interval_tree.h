@@ -5,6 +5,7 @@
 #pragma once
 
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 
 /*
@@ -24,12 +25,25 @@ struct interval_tree_node {
     uint64_t                   start;
     uint64_t                   end;
     uint64_t                   max_end;
+    uint64_t                   sequence;
     enum interval_tree_color color;
 };
 
 struct interval_tree {
     struct interval_tree_node *root;
     struct interval_tree_node  nil;
+    uint64_t                   next_sequence;
+};
+
+struct interval_tree_overlap_iterator {
+    uint64_t start;
+    uint64_t end;
+    uint64_t max_sequence;
+    uint64_t last_start;
+    uint64_t last_end;
+    uint64_t last_sequence;
+    size_t   nodes_visited;
+    bool     valid;
 };
 
 typedef bool (*interval_tree_visit_fn)(
@@ -39,14 +53,15 @@ typedef bool (*interval_tree_visit_fn)(
 static inline void
 interval_tree_init(struct interval_tree *tree)
 {
-    tree->nil.left    = &tree->nil;
-    tree->nil.right   = &tree->nil;
-    tree->nil.parent  = &tree->nil;
-    tree->nil.start   = 0;
-    tree->nil.end     = 0;
-    tree->nil.max_end = 0;
-    tree->nil.color   = INTERVAL_TREE_BLACK;
-    tree->root        = &tree->nil;
+    tree->nil.left      = &tree->nil;
+    tree->nil.right     = &tree->nil;
+    tree->nil.parent    = &tree->nil;
+    tree->nil.start     = 0;
+    tree->nil.end       = 0;
+    tree->nil.max_end   = 0;
+    tree->nil.color     = INTERVAL_TREE_BLACK;
+    tree->root          = &tree->nil;
+    tree->next_sequence = 1;
 } /* interval_tree_init */
 
 static inline bool
@@ -66,13 +81,14 @@ interval_tree_node_init(
         return false;
     }
 
-    node->left    = NULL;
-    node->right   = NULL;
-    node->parent  = NULL;
-    node->start   = start;
-    node->end     = end;
-    node->max_end = end;
-    node->color   = INTERVAL_TREE_RED;
+    node->left     = NULL;
+    node->right    = NULL;
+    node->parent   = NULL;
+    node->start    = start;
+    node->end      = end;
+    node->max_end  = end;
+    node->sequence = 0;
+    node->color    = INTERVAL_TREE_RED;
     return true;
 } /* interval_tree_node_init */
 
@@ -86,6 +102,9 @@ interval_tree_compare(
     }
     if (a->end != b->end) {
         return a->end < b->end ? -1 : 1;
+    }
+    if (a->sequence != b->sequence) {
+        return a->sequence < b->sequence ? -1 : 1;
     }
     return 0;
 } /* interval_tree_compare */
@@ -229,6 +248,11 @@ interval_tree_insert(
         node->right != NULL || node->parent != NULL) {
         return false;
     }
+    if (tree->next_sequence == 0) {
+        return false;
+    }
+
+    node->sequence = tree->next_sequence++;
 
     while (cursor != &tree->nil) {
         parent = cursor;
@@ -434,6 +458,7 @@ interval_tree_remove(
     node->right      = NULL;
     node->parent     = NULL;
     node->max_end    = node->end;
+    node->sequence   = 0;
     node->color      = INTERVAL_TREE_RED;
 } /* interval_tree_remove */
 
@@ -547,6 +572,100 @@ interval_tree_first_overlap(
     }
     return interval_tree_first_overlap_node(tree, tree->root, start, end);
 } /* interval_tree_first_overlap */
+
+static inline bool
+interval_tree_key_after_iterator(
+    const struct interval_tree_node             *node,
+    const struct interval_tree_overlap_iterator *iterator)
+{
+    if (!iterator->valid) {
+        return true;
+    }
+    if (node->start != iterator->last_start) {
+        return node->start > iterator->last_start;
+    }
+    if (node->end != iterator->last_end) {
+        return node->end > iterator->last_end;
+    }
+    return node->sequence > iterator->last_sequence;
+} /* interval_tree_key_after_iterator */
+
+static inline struct interval_tree_node *
+interval_tree_first_overlap_after_node(
+    struct interval_tree                  *tree,
+    struct interval_tree_node             *node,
+    struct interval_tree_overlap_iterator *iterator)
+{
+    struct interval_tree_node *found;
+
+    if (node == &tree->nil || node->max_end < iterator->start) {
+        return NULL;
+    }
+    iterator->nodes_visited++;
+
+    if (node->start > iterator->end) {
+        return interval_tree_first_overlap_after_node(tree, node->left,
+                                                      iterator);
+    }
+
+    if (!interval_tree_key_after_iterator(node, iterator)) {
+        return interval_tree_first_overlap_after_node(tree, node->right,
+                                                      iterator);
+    }
+
+    found = interval_tree_first_overlap_after_node(tree, node->left, iterator);
+    if (found) {
+        return found;
+    }
+    if (node->sequence <= iterator->max_sequence &&
+        interval_tree_overlaps(node, iterator->start, iterator->end)) {
+        return node;
+    }
+    return interval_tree_first_overlap_after_node(tree, node->right, iterator);
+} /* interval_tree_first_overlap_after_node */
+
+/* Snapshot the tree's insertion sequence, then return each original overlap
+ * in key order.  The caller may remove the returned node and insert new nodes
+ * between calls: removed-node links are never retained, and nodes inserted
+ * after initialization are excluded.  `nodes_visited` supports complexity
+ * assertions in tests and diagnostics. */
+static inline void
+interval_tree_overlap_iterator_init(
+    struct interval_tree                  *tree,
+    struct interval_tree_overlap_iterator *iterator,
+    uint64_t                               start,
+    uint64_t                               end)
+{
+    iterator->start        = start;
+    iterator->end          = end;
+    iterator->max_sequence = tree->next_sequence == 0
+        ? UINT64_MAX : tree->next_sequence - 1;
+    iterator->last_start    = 0;
+    iterator->last_end      = 0;
+    iterator->last_sequence = 0;
+    iterator->nodes_visited = 0;
+    iterator->valid         = false;
+} /* interval_tree_overlap_iterator_init */
+
+static inline struct interval_tree_node *
+interval_tree_overlap_iterator_next(
+    struct interval_tree                  *tree,
+    struct interval_tree_overlap_iterator *iterator)
+{
+    struct interval_tree_node *node;
+
+    if (iterator->start > iterator->end) {
+        return NULL;
+    }
+    node = interval_tree_first_overlap_after_node(tree, tree->root, iterator);
+    if (node) {
+        iterator->last_start    = node->start;
+        iterator->last_end      = node->end;
+        iterator->last_sequence = node->sequence;
+        iterator->valid         = true;
+    }
+    return node;
+} /* interval_tree_overlap_iterator_next */
 
 static inline bool
 interval_tree_visit_node(

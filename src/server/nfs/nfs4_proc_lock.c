@@ -212,12 +212,26 @@ chimera_nfs4_lock_replace_coverage(
         return;
     }
 
-    chimera_vfs_claim_range_replace(vfs_state, fs, &rl->claim.owner,
-                                    /* except   */ &rl->claim,
-                                    rl->claim.offset, rl->claim.length,
-                                    /* new_mask */ 0,
-                                    spare, n_spare, &spare_used,
-                                    /* released_cb */ NULL, NULL);
+    if (!chimera_vfs_claim_range_replace(vfs_state, fs, &rl->claim.owner,
+                                         /* except   */ &rl->claim,
+                                         rl->claim.offset, rl->claim.length,
+                                         /* new_mask */ 0,
+                                         spare, n_spare, &spare_used,
+                                         /* released_cb */ NULL, NULL)) {
+        for (i = 0; i < n_spare; i++) {
+            chimera_vfs_state_put(vfs_state, rem[i]->file_state);
+            free(rem[i]);
+        }
+        free(rem);
+        free(spare);
+        while (hits) {
+            e                        = hits;
+            hits                     = e->next;
+            e->next                  = lock_state->range_leases;
+            lock_state->range_leases = e;
+        }
+        return;
+    }
 
     if (spare_used > n_spare) {
         spare_used = n_spare;

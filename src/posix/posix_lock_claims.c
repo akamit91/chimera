@@ -216,7 +216,7 @@ chimera_posix_lock_carve_released(
     ctx->freed = node;
 } /* chimera_posix_lock_carve_released */
 
-void
+bool
 chimera_posix_ofd_lock_carve(
     struct chimera_posix_client      *posix,
     struct chimera_posix_ofd         *ofd,
@@ -227,13 +227,11 @@ chimera_posix_ofd_lock_carve(
     uint64_t                          length)
 {
     struct chimera_vfs_state           *state = chimera_posix_vfs_state(posix);
-    struct chimera_posix_ofd_lock      *spare_nodes[POSIX_LOCK_CARVE_SPARES];
-    struct chimera_vfs_claim           *spare[POSIX_LOCK_CARVE_SPARES];
-    struct chimera_posix_lock_carve_ctx ctx = { .posix = posix,
-                                                .freed = NULL };
-    int                                 spare_used = 0;
+    struct chimera_posix_lock_carve_ctx ctx   = { .posix = posix,
+                                                  .freed = NULL };
     struct chimera_vfs_file_state      *file;
-    struct chimera_posix_ofd_lock      *node;
+    int                                 spare_capacity = 0;
+    int                                 spare_used;
     int                                 i;
 
     file = chimera_vfs_state_get(state,
@@ -241,75 +239,109 @@ chimera_posix_ofd_lock_carve(
                                  (uint8_t) handle->fh_len,
                                  handle->fh_hash,
                                  /* create */ true);
+    if (!file) {
+        return false;
+    }
 
-    /* Two heap spares: a mid-range carve splits one claim into head and
-     * tail fragments.  The core copies the split claim into a consumed
-     * spare (offset/length rewritten) and links it, so the claim needs no
-     * init here; each spare carries its own anchor reference in case it is
-     * inserted. */
-    for (i = 0; i < POSIX_LOCK_CARVE_SPARES; i++) {
-        spare_nodes[i] = calloc(1, sizeof(*spare_nodes[i]));
+    for (;;) {
+        struct chimera_posix_ofd_lock **spare_nodes;
+        struct chimera_vfs_claim      **spare;
+        struct chimera_posix_ofd_lock  *node;
+        bool                            carved;
 
-        if (!spare_nodes[i]) {
-            /* Drop the spares already built and skip the carve.  Leaving the
-             * claim unsplit holds more of the range than was asked for, which
-             * is a far better failure than dereferencing NULL. */
+        spare_nodes = NULL;
+        spare       = NULL;
+        if (spare_capacity > 0) {
+            spare_nodes = calloc((size_t) spare_capacity, sizeof(*spare_nodes));
+            spare       = calloc((size_t) spare_capacity, sizeof(*spare));
+            if (!spare_nodes || !spare) {
+                free(spare_nodes);
+                free(spare);
+                chimera_vfs_state_put(state, file);
+                return false;
+            }
+        }
+
+        for (i = 0; i < spare_capacity; i++) {
+            spare_nodes[i] = calloc(1, sizeof(*spare_nodes[i]));
+            if (!spare_nodes[i]) {
+                break;
+            }
+            spare_nodes[i]->file = chimera_vfs_state_get(
+                state, handle->fh, (uint8_t) handle->fh_len,
+                handle->fh_hash, /* create */ true);
+            if (!spare_nodes[i]->file) {
+                free(spare_nodes[i]);
+                spare_nodes[i] = NULL;
+                break;
+            }
+            spare[i] = &spare_nodes[i]->claim;
+        }
+        if (i < spare_capacity) {
             while (i-- > 0) {
                 chimera_vfs_state_put(state, spare_nodes[i]->file);
                 free(spare_nodes[i]);
             }
+            free(spare_nodes);
+            free(spare);
             chimera_vfs_state_put(state, file);
-            return;
+            return false;
         }
 
-        spare_nodes[i]->file = chimera_vfs_state_get(state,
-                                                     handle->fh,
-                                                     (uint8_t) handle->fh_len,
-                                                     handle->fh_hash,
-                                                     /* create */ true);
-        spare[i] = &spare_nodes[i]->claim;
+        evpl_mutex_lock(&posix->fd_lock);
+        carved = chimera_vfs_claim_range_replace(
+            state, file, owner, except, offset, length, /* new_mask */ 0,
+            spare, spare_capacity, &spare_used,
+            chimera_posix_lock_carve_released, &ctx);
+        if (carved) {
+            /* Consumed spares become tracked head/tail fragments. */
+            for (i = 0; i < spare_used; i++) {
+                spare_nodes[i]->ofd = ofd;
+                DL_APPEND(ofd->locks, spare_nodes[i]);
+                atomic_fetch_add(&posix->n_range_locks, 1);
+            }
+        }
+        evpl_mutex_unlock(&posix->fd_lock);
+
+        if (!carved && spare_used > spare_capacity) {
+            for (i = 0; i < spare_capacity; i++) {
+                chimera_vfs_state_put(state, spare_nodes[i]->file);
+                free(spare_nodes[i]);
+            }
+            free(spare_nodes);
+            free(spare);
+            spare_capacity = spare_used;
+            continue;
+        }
+
+        if (!carved) {
+            for (i = 0; i < spare_capacity; i++) {
+                chimera_vfs_state_put(state, spare_nodes[i]->file);
+                free(spare_nodes[i]);
+            }
+            free(spare_nodes);
+            free(spare);
+            chimera_vfs_state_put(state, file);
+            return false;
+        }
+
+        for (i = spare_used; i < spare_capacity; i++) {
+            chimera_vfs_state_put(state, spare_nodes[i]->file);
+            free(spare_nodes[i]);
+        }
+        free(spare_nodes);
+        free(spare);
+
+        while (ctx.freed) {
+            node      = ctx.freed;
+            ctx.freed = node->next;
+            chimera_vfs_state_put(state, node->file);
+            free(node);
+        }
+
+        chimera_vfs_state_put(state, file);
+        return true;
     }
-
-    evpl_mutex_lock(&posix->fd_lock);
-
-    chimera_vfs_claim_range_replace(state, file, owner, except, offset, length,
-                                    /* new_mask */ 0,
-                                    spare, POSIX_LOCK_CARVE_SPARES, &spare_used,
-                                    chimera_posix_lock_carve_released, &ctx);
-
-    /* The core takes at most the spares it was handed, but it lives in
-     * another translation unit, so bound the count here to keep both loops
-     * below inside spare_nodes[]. */
-    if (spare_used > POSIX_LOCK_CARVE_SPARES) {
-        spare_used = POSIX_LOCK_CARVE_SPARES;
-    }
-
-    /* Consumed spares are now inserted head/tail fragments: track them.
-     * CLAIMTODO: fragments attribute to the UNLOCKING description even when
-     * the split lock was taken through a different description of the same
-     * file -- harmless for arbitration (one per-process owner) but release
-     * timing follows this OFD's last close. */
-    for (i = 0; i < spare_used; i++) {
-        spare_nodes[i]->ofd = ofd;
-        DL_APPEND(ofd->locks, spare_nodes[i]);
-        atomic_fetch_add(&posix->n_range_locks, 1);
-    }
-
-    evpl_mutex_unlock(&posix->fd_lock);
-
-    for (i = spare_used; i < POSIX_LOCK_CARVE_SPARES; i++) {
-        chimera_vfs_state_put(state, spare_nodes[i]->file);
-        free(spare_nodes[i]);
-    }
-
-    while (ctx.freed) {
-        node      = ctx.freed;
-        ctx.freed = node->next;
-        chimera_vfs_state_put(state, node->file);
-        free(node);
-    }
-
-    chimera_vfs_state_put(state, file);
 } /* chimera_posix_ofd_lock_carve */
 
 /* -------------------------------------------------------------------- */
@@ -663,6 +695,7 @@ struct chimera_posix_unlock_ctx {
     evpl_mutex_t                    mutex;
     evpl_cond_t                     cond;
     int                             done;
+    bool                            carved;
 };
 
 static void
@@ -685,9 +718,13 @@ chimera_posix_unlock_exec(
     struct chimera_vfs_state        *state = chimera_posix_vfs_state(ctx->posix);
     struct chimera_vfs_file_state   *file;
 
-    chimera_posix_ofd_lock_carve(ctx->posix, ctx->ofd, ctx->handle,
-                                 &ctx->owner, ctx->except, ctx->offset,
-                                 ctx->length);
+    ctx->carved = chimera_posix_ofd_lock_carve(
+        ctx->posix, ctx->ofd, ctx->handle, &ctx->owner, ctx->except,
+        ctx->offset, ctx->length);
+    if (!ctx->carved) {
+        chimera_posix_unlock_flushed(ctx);
+        return;
+    }
 
     file = chimera_vfs_state_get(state, ctx->handle->fh,
                                  (uint8_t) ctx->handle->fh_len,
@@ -699,7 +736,7 @@ chimera_posix_unlock_exec(
     chimera_vfs_state_put(state, file);
 } /* chimera_posix_unlock_exec */
 
-static void
+static bool
 chimera_posix_lock_claim_carve_wait(
     struct chimera_posix_client    *posix,
     struct chimera_posix_ofd       *ofd,
@@ -717,9 +754,8 @@ chimera_posix_lock_claim_carve_wait(
     chimera_posix_lock_owner_init(&owner);
 
     if (!chimera_vfs_claim_backend_range_capable(state)) {
-        chimera_posix_ofd_lock_carve(posix, ofd, handle, &owner, except,
-                                     offset, length);
-        return;
+        return chimera_posix_ofd_lock_carve(posix, ofd, handle, &owner,
+                                            except, offset, length);
     }
 
     memset(&ctx, 0, sizeof(ctx));
@@ -747,9 +783,10 @@ chimera_posix_lock_claim_carve_wait(
 
     evpl_mutex_destroy(&ctx.mutex);
     evpl_cond_destroy(&ctx.cond);
+    return ctx.carved;
 } /* chimera_posix_lock_claim_carve_wait */
 
-void
+bool
 chimera_posix_lock_claim_unlock(
     struct chimera_posix_client    *posix,
     struct chimera_posix_ofd       *ofd,
@@ -757,8 +794,8 @@ chimera_posix_lock_claim_unlock(
     uint64_t                        offset,
     uint64_t                        length)
 {
-    chimera_posix_lock_claim_carve_wait(posix, ofd, handle, NULL,
-                                        offset, length);
+    return chimera_posix_lock_claim_carve_wait(posix, ofd, handle, NULL,
+                                               offset, length);
 } /* chimera_posix_lock_claim_unlock */
 
 /* Release a backend range this node holds without a local claim, by
@@ -915,7 +952,7 @@ chimera_posix_locks_release_file(
     chimera_posix_lock_claim_unlock(posix, ofd, handle, 0, UINT64_MAX);
 } /* chimera_posix_locks_release_file */
 
-void
+bool
 chimera_posix_ofd_lock_replace(
     struct chimera_posix_client    *posix,
     struct chimera_posix_ofd       *ofd,
@@ -936,7 +973,7 @@ chimera_posix_ofd_lock_replace(
                                  handle->fh_hash, /* create */ false);
 
     if (!file) {
-        return;
+        return true;
     }
 
     chimera_posix_lock_owner_init(&owner);
@@ -945,13 +982,13 @@ chimera_posix_ofd_lock_replace(
     chimera_vfs_state_put(state, file);
 
     if (!held) {
-        return;
+        return true;
     }
 
     /* Waited, like an unlock: until the backend has dropped the older,
      * possibly STRONGER record, it still answers for this range, and a
      * F_GETLK from another owner would be told the downgrade never
      * happened. */
-    chimera_posix_lock_claim_carve_wait(posix, ofd, handle, &node->claim,
-                                        offset, length);
+    return chimera_posix_lock_claim_carve_wait(posix, ofd, handle,
+                                               &node->claim, offset, length);
 } /* chimera_posix_ofd_lock_replace */

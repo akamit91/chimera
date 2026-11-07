@@ -1781,11 +1781,17 @@ chimera_nfs_nlm4_carve(
      * carve pumps too): its carve looks for the owner's locks on
      * client->locks, where the remainders of this carve are not yet.  They
      * are relinked below, and only then is the queue pumped. */
-    chimera_vfs_claim_range_replace_nopump(vfs_state, straddle->file_state,
-                                           owner, except, offset, length,
-                                           /* new_mask */ 0,
-                                           spare, n_spare, &spare_used,
-                                           /* released_cb */ NULL, NULL);
+    if (!chimera_vfs_claim_range_replace_nopump(
+            vfs_state, straddle->file_state, owner, except, offset, length,
+            /* new_mask */ 0, spare, n_spare, &spare_used,
+            /* released_cb */ NULL, NULL)) {
+        for (i = 0; i < n_spare; i++) {
+            nlm_lock_entry_free(rem[i]);
+        }
+        free(rem);
+        free(spare);
+        return false;
+    }
 
     if (spare_used > n_spare) {
         spare_used = n_spare;
