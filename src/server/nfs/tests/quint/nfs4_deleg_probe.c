@@ -556,6 +556,7 @@ test_clone_bounds(
     ops[1].opwrite.data.length = 4096;
     p                          = pc_compound(pc, ops, 2, 1);
     expect("CLONE source initialized", p.status == NFS4_OK, "WRITE");
+#ifndef _WIN32
     if (pc->env->pt_root[0]) {
         char path[512], data[4096];
         int  fd;
@@ -569,6 +570,7 @@ test_clone_bounds(
         }
         size = 8192;
     }
+#endif /* ifndef _WIN32 */
     for (i = 0; i < 4; i++) {
         memset(ops, 0, sizeof(ops));
         ops[0]                        = op_putfh(&src.fh);

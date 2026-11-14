@@ -1287,6 +1287,9 @@ if(Python3_FOUND)
 endif()
 
 foreach(backend memfs linux)
+    if(backend STREQUAL "linux" AND NOT CHIMERA_LINUX)
+        continue()
+    endif()
     add_test(NAME chimera/server/nfs/mbt4/clone_bounds_${backend}
         COMMAND $<TARGET_FILE:nfs4_deleg_probe> --clone ${backend})
     set_tests_properties(chimera/server/nfs/mbt4/clone_bounds_${backend} PROPERTIES
