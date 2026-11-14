@@ -247,10 +247,15 @@ chimera_fuse_grant_put(
      * the last reference -- regardless of what the racy state read showed --
      * is always safe and guarantees the claim is never still linked into
      * file->claims at the point its embedding grant is freed below. */
-    chimera_vfs_claim_release(state, grant->file_state, &grant->claim);
+    if (atomic_load(&mount->grants_closing)) {
+        chimera_vfs_claim_release_nopump(state, grant->file_state, &grant->claim);
+    } else {
+        chimera_vfs_claim_release(state, grant->file_state, &grant->claim);
+    }
 
     chimera_vfs_state_put(state, grant->file_state);
     free(grant);
+    atomic_fetch_sub(&mount->grants_live, 1);
 } /* chimera_fuse_grant_put */
 
 /* Resolve a broken grant: invalidate the kernel's view of the file, settle
@@ -265,11 +270,15 @@ chimera_fuse_grant_resolve(
 
     chimera_fuse_inval_attrs(mount, grant->nodeid);
 
-    if (!atomic_load(&grant->revoked)) {
+    if (!atomic_load(&grant->revoked) && !atomic_load(&mount->grants_closing)) {
         chimera_vfs_claim_ack(&grant->claim, 0);
     }
 
-    chimera_vfs_claim_release(state, grant->file_state, &grant->claim);
+    if (atomic_load(&mount->grants_closing)) {
+        chimera_vfs_claim_release_nopump(state, grant->file_state, &grant->claim);
+    } else {
+        chimera_vfs_claim_release(state, grant->file_state, &grant->claim);
+    }
 
     atomic_store(&grant->state, CHIMERA_FUSE_GRANT_BROKEN);
 
@@ -636,6 +645,10 @@ chimera_fuse_grant_ensure(
     int                        rc;
 
     evpl_mutex_lock(&mount->grant_lock);
+    if (atomic_load(&mount->grants_closing)) {
+        evpl_mutex_unlock(&mount->grant_lock);
+        return CHIMERA_FUSE_COVER_NONE;
+    }
 
     HASH_FIND(hh, mount->grants, &nodeid, sizeof(nodeid), grant);
 
@@ -677,9 +690,11 @@ chimera_fuse_grant_ensure(
         return CHIMERA_FUSE_COVER_NONE;
     }
 
+    atomic_fetch_add(&mount->grants_live, 1);
     if (chimera_fuse_grant_arm(state, grant) != 0) {
         evpl_mutex_unlock(&mount->grant_lock);
         chimera_vfs_state_put(state, grant->file_state);
+        atomic_fetch_sub(&mount->grants_live, 1);
         free(grant);
         return CHIMERA_FUSE_COVER_NONE;
     }
@@ -807,7 +822,7 @@ chimera_fuse_grant_claim_try_get(
     (void) claim;
 
     for ( ; ; ) {
-        if (cur <= 0) {
+        if (cur <= 0 || atomic_load(&grant->mount->grants_closing)) {
             return false;
         }
         if (atomic_compare_exchange_weak(&grant->refcount, &cur, cur + 1)) {
@@ -968,15 +983,14 @@ chimera_fuse_watch_forget(
 /* Teardown                                                            */
 /* ------------------------------------------------------------------ */
 
-/* Runs at protocol destroy(), after the thread pool is gone: force-drop
- * whatever the sweeps could not (grants whose break was queued after the
- * notifier drained, watches for directories never forgotten). */
+/* Runs after the thread pool is gone, with pin admission closed at stop().
+ * The notifier and VFS remain alive until every dispatch and notice drains. */
 void
 chimera_fuse_coherence_shutdown(
     struct chimera_fuse_shared *shared,
     struct chimera_fuse_mount  *mount)
 {
-    struct chimera_fuse_grant    *grant, *gtmp;
+    struct chimera_fuse_grant    *grant;
     struct chimera_fuse_dirwatch *dw, *dwtmp;
 
 #ifndef __clang_analyzer__
@@ -984,6 +998,8 @@ chimera_fuse_coherence_shutdown(
      * body compiled out the analyser sees only a dead initialisation. */
     struct chimera_vfs_state     *state = shared->vfs->vfs_state;
 
+    atomic_store(&mount->grants_closing, 1);
+    evpl_mutex_lock(&mount->grant_lock);
     HASH_ITER(hh, mount->dirwatches, dw, dwtmp)
     {
         HASH_DELETE(hh, mount->dirwatches, dw);
@@ -991,16 +1007,25 @@ chimera_fuse_coherence_shutdown(
         free(dw);
     }
 
-    HASH_ITER(hh, mount->grants, grant, gtmp)
-    {
-        HASH_DELETE(hh, mount->grants, grant);
-
-        if (atomic_load(&grant->state) == CHIMERA_FUSE_GRANT_ACTIVE) {
-            chimera_vfs_claim_release(state, grant->file_state, &grant->claim);
+    evpl_mutex_unlock(&mount->grant_lock);
+    for (;;) {
+        evpl_mutex_lock(&mount->grant_lock);
+        grant = mount->grants;
+        if (grant) {
+            HASH_DELETE(hh, mount->grants, grant);
         }
-
-        chimera_vfs_state_put(state, grant->file_state);
-        free(grant);
+        evpl_mutex_unlock(&mount->grant_lock);
+        if (!grant) {
+            break;
+        }
+        chimera_vfs_claim_release_nopump(state, grant->file_state, &grant->claim);
+        chimera_fuse_grant_put(mount, state, grant);
+    }
+    atomic_store(&mount->grants_closing, 2);
+    /* Includes grants detached by FORGET, and notifier references created
+     * by dispatches that acquired a pin before the closing gate. */
+    while (atomic_load(&mount->grants_live)) {
+        usleep(1000);
     }
 #endif /* ifndef __clang_analyzer__ */
 } /* chimera_fuse_coherence_shutdown */

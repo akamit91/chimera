@@ -942,23 +942,19 @@ chimera_vfs_claim_trigger_ns_full(
                 if (cur->break_state == CHIMERA_CLAIM_BREAK_ACKED) {
                     cur->break_state = CHIMERA_CLAIM_BREAK_IDLE;
                 }
+                if (!chimera_vfs_claim_ref_take(cur, &break_ref)) {
+                    continue;
+                }
                 to_break = cur;
                 break;
             }
             if (cur->break_state == CHIMERA_CLAIM_BREAK_BREAKING &&
                 chimera_vfs_claim_deadline_passed(cur)) {
+                if (!chimera_vfs_claim_ref_take(cur, &break_ref)) {
+                    continue;
+                }
                 to_revoke = cur;
                 break;
-            }
-        }
-        if (to_break) {
-            if (!chimera_vfs_claim_ref_take(to_break, &break_ref)) {
-                /* Teardown has committed: its release will pump us. */
-                to_break = NULL;
-            }
-        } else if (to_revoke) {
-            if (!chimera_vfs_claim_ref_take(to_revoke, &break_ref)) {
-                to_revoke = NULL;
             }
         }
         evpl_mutex_unlock(&file->lock);
@@ -1048,23 +1044,19 @@ chimera_vfs_claim_trigger_ns_unlink(
                 continue;
             }
             if (cur->break_state == CHIMERA_CLAIM_BREAK_IDLE) {
+                if (!chimera_vfs_claim_ref_take(cur, &victim_ref)) {
+                    continue;
+                }
                 to_break = cur;
                 break;
             }
             if (cur->break_state == CHIMERA_CLAIM_BREAK_BREAKING &&
                 chimera_vfs_claim_deadline_passed(cur)) {
+                if (!chimera_vfs_claim_ref_take(cur, &victim_ref)) {
+                    continue;
+                }
                 to_revoke = cur;
                 break;
-            }
-        }
-        if (to_break) {
-            if (!chimera_vfs_claim_ref_take(to_break, &victim_ref)) {
-                /* Teardown has committed: its release will pump us. */
-                to_break = NULL;
-            }
-        } else if (to_revoke) {
-            if (!chimera_vfs_claim_ref_take(to_revoke, &victim_ref)) {
-                to_revoke = NULL;
             }
         }
         evpl_mutex_unlock(&file->lock);

@@ -197,14 +197,14 @@ void chimera_vfs_claim_trigger_fire(
 
 /* NS_FULL / FLUSH / NS_UNLINK engines (return true while still blocked);
  * used by the parking io path and the public query verbs. */
-bool chimera_vfs_claim_trigger_ns_full(
+SYMBOL_EXPORT bool chimera_vfs_claim_trigger_ns_full(
     struct chimera_vfs_state             *state,
     struct chimera_vfs_file_state        *file,
     const struct chimera_vfs_open_handle *skip_handle,
     bool                                  flush_only,
     const struct chimera_claim_actor     *actor);
 
-bool chimera_vfs_claim_trigger_ns_unlink(
+SYMBOL_EXPORT bool chimera_vfs_claim_trigger_ns_unlink(
     struct chimera_vfs_state             *state,
     struct chimera_vfs_file_state        *file,
     const struct chimera_vfs_open_handle *skip_handle,

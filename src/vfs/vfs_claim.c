@@ -1710,7 +1710,9 @@ chimera_vfs_claim_acquire_or_queue(
          * release path pumps this file's pending queue when it unlinks. */
         if ((current == CHIMERA_CLAIM_BREAKING && ticket->wait &&
              (holder->break_state == CHIMERA_CLAIM_BREAK_IDLE ||
-              holder->break_state == CHIMERA_CLAIM_BREAK_ACKED)) ||
+              holder->break_state == CHIMERA_CLAIM_BREAK_ACKED ||
+              (holder->break_state == CHIMERA_CLAIM_BREAK_BREAKING &&
+               chimera_vfs_claim_deadline_passed(holder)))) ||
             (current == CHIMERA_CLAIM_DENIED && ticket->wait_hard &&
              chimera_vfs_claim_holder_reclaimable(holder, ticket->claim))) {
             /* A successful probe pin must not be dropped here: ref_drop()
@@ -1920,7 +1922,9 @@ chimera_vfs_claim_release_common(
         chimera_vfs_claim_unlink_locked(file, claim);
     }
     if (grant) {
-        last = chimera_vfs_claim_grant_release_locked(grant);
+        grant->pump_on_release |= pump;
+        pump                    = pump && !grant->pump_suppressed;
+        last                    = chimera_vfs_claim_grant_release_locked(grant);
     }
     token                = claim->backend_token;
     claim->backend_token = 0;
@@ -2505,17 +2509,23 @@ chimera_vfs_claim_grant_acquire(
     return CHIMERA_CLAIM_GRANTED;
 } /* chimera_vfs_claim_grant_acquire */
 
-SYMBOL_EXPORT void
-chimera_vfs_claim_grant_release(
+static void
+chimera_vfs_claim_grant_put(
     struct chimera_vfs_state       *state,
     struct chimera_vfs_claim_grant *grant,
-    bool                            pump)
+    bool                            pump,
+    bool                            shutdown)
 {
     struct chimera_vfs_file_state *file = grant->file;
     bool                           last;
 
     evpl_mutex_lock(&file->lock);
-    last = chimera_vfs_claim_grant_release_locked(grant);
+    /* Dispatch puts preserve deferred wakeups; shutdown suppresses them
+     * even when an earlier member release requested a pump. */
+    grant->pump_suppressed |= shutdown;
+    grant->pump_on_release |= pump;
+    pump                    = grant->pump_on_release && !grant->pump_suppressed;
+    last                    = chimera_vfs_claim_grant_release_locked(grant);
     evpl_mutex_unlock(&file->lock);
 
     if (last) {
@@ -2526,6 +2536,15 @@ chimera_vfs_claim_grant_release(
         chimera_vfs_claim_backend_reeval(state, file);
         free(grant);
     }
+} /* chimera_vfs_claim_grant_put */
+
+SYMBOL_EXPORT void
+chimera_vfs_claim_grant_release(
+    struct chimera_vfs_state       *state,
+    struct chimera_vfs_claim_grant *grant,
+    bool                            pump)
+{
+    chimera_vfs_claim_grant_put(state, grant, pump, !pump);
 } /* chimera_vfs_claim_grant_release */
 
 struct chimera_vfs_claim_grant *
@@ -2646,7 +2665,7 @@ chimera_vfs_claim_ref_drop(
     /* Neither branch may touch ref->claim afterwards: dropping the last
      * reference runs the owner's teardown, which frees the object. */
     if (ref->grant) {
-        chimera_vfs_claim_grant_release(state, ref->grant, false);
+        chimera_vfs_claim_grant_put(state, ref->grant, false, false);
     } else if (ref->ops) {
         ref->ops->put(ref->private_data, state);
     }

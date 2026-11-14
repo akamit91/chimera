@@ -26,6 +26,7 @@
 #include <assert.h>
 
 #include "vfs/vfs_claim.h"
+#include "vfs/vfs_claim_internal.h"
 #include "vfs/vfs_claim_owner.h"
 #include "vfs/vfs_internal.h"
 #include "common/logging.h"
@@ -2355,10 +2356,144 @@ test_try_acquire_breaking_conflict_pin_refused(void)
     CHECK(a.break_state != CHIMERA_CLAIM_BREAK_BREAKING,
           "the refused holder was never dispatched a break");
 
-    chimera_vfs_claim_release(state, file, &a);
+    {
+        struct chimera_vfs_pending_acquire ticket;
+        struct acquire_recorder            rec = { 0 };
+        a.break_state    = CHIMERA_CLAIM_BREAK_BREAKING;
+        a.break_deadline = 0;
+        chimera_vfs_claim_acquire(NULL, state, file, &b, &ticket, true, false,
+                                  recording_acquire_cb, NULL, &rec);
+        CHECK(ticket.queued && !rec.fired, "expired refused-pin holder parks waiter");
+        chimera_vfs_claim_release(state, file, &a);
+        CHECK(rec.fired == 1 && rec.last_result == CHIMERA_CLAIM_GRANTED,
+              "owner unlink wakes expired-break waiter");
+        chimera_vfs_claim_release(state, file, &b);
+    }
     chimera_vfs_state_put(state, file);
     chimera_vfs_state_destroy(state);
 } /* test_try_acquire_breaking_conflict_pin_refused */
+
+static void
+test_namespace_skips_refused_pin(void)
+{
+    int full;
+
+    for (full = 0; full < 2; full++) {
+        struct chimera_vfs_state      *state = chimera_vfs_state_init();
+        struct chimera_vfs_file_state *file  = get_file(state, 99);
+        struct chimera_claim_owner     owner;
+        struct chimera_vfs_claim       a, b;
+        struct owner_pin_probe         refusing = { 0 }, live = { 0 };
+
+        init_owner(&owner, CHIMERA_CLAIM_PROTO_INTERNAL, 1, 1);
+        chimera_vfs_claim_init_oplock(&b, CHIMERA_CLAIM_CR, &owner);
+        b.break_cb   = noop_break_cb;
+        b.cb_private = &live;
+        assert(chimera_vfs_claim_try_acquire(state, file, &b, NULL) == CHIMERA_CLAIM_GRANTED);
+        init_owner(&owner, CHIMERA_CLAIM_PROTO_INTERNAL, 2, 2);
+        chimera_vfs_claim_init_oplock(&a, CHIMERA_CLAIM_CR, &owner);
+        a.break_cb   = noop_break_cb;
+        a.cb_private = &refusing;
+        assert(chimera_vfs_claim_try_acquire(state, file, &a, NULL) == CHIMERA_CLAIM_GRANTED);
+        refusing.refuse = true;
+        if (full) {
+            chimera_vfs_claim_trigger_ns_full(state, file, NULL, false, NULL);
+        } else {
+            chimera_vfs_claim_trigger_ns_unlink(state, file, NULL, 0);
+        }
+        CHECK(b.break_state == CHIMERA_CLAIM_BREAK_BREAKING,
+              "namespace recall drives later holder after refused pin");
+        chimera_vfs_claim_release(state, file, &a);
+        chimera_vfs_claim_release(state, file, &b);
+        chimera_vfs_state_put(state, file);
+        chimera_vfs_state_destroy(state);
+    }
+} /* test_namespace_skips_refused_pin */
+
+static void
+test_last_pin_wakes_waiter(void)
+{
+    struct chimera_vfs_state          *state = chimera_vfs_state_init();
+    struct chimera_vfs_file_state     *file  = get_file(state, 98);
+    struct chimera_claim_owner         owner;
+    struct chimera_vfs_claim           cache, range;
+    struct chimera_vfs_claim_grant    *grant;
+    struct chimera_vfs_claim_ref       ref;
+    struct chimera_vfs_pending_acquire ticket;
+    struct acquire_recorder            rec = { 0 };
+
+    init_owner(&owner, CHIMERA_CLAIM_PROTO_SMB2, 1, 1);
+    chimera_vfs_claim_init_oplock(&cache, CHIMERA_CLAIM_CR | CHIMERA_CLAIM_CW, &owner);
+    cache.break_cb = noop_break_cb;
+    assert(chimera_vfs_claim_grant_acquire(state, file, &cache, 0, 0,
+                                           CHIMERA_CLAIM_GRANT_EXACT, NULL, NULL, &grant, NULL) == CHIMERA_CLAIM_GRANTED
+           );
+    evpl_mutex_lock(&file->lock);
+    assert(chimera_vfs_claim_ref_take(&grant->claim, &ref));
+    evpl_mutex_unlock(&file->lock);
+    init_owner(&owner, CHIMERA_CLAIM_PROTO_SMB2, 2, 2);
+    chimera_vfs_claim_init_range(&range, true, false, 0, 100, &owner);
+    chimera_vfs_claim_acquire(NULL, state, file, &range, &ticket, true, false,
+                              recording_acquire_cb, NULL, &rec);
+    CHECK(ticket.queued, "range waits on pinned cache grant");
+    chimera_vfs_claim_grant_release(state, grant, true);
+    CHECK(!rec.fired, "member release leaves dispatch pin blocking waiter");
+    chimera_vfs_claim_ref_drop(state, &ref);
+    CHECK(rec.fired == 1 && rec.last_result == CHIMERA_CLAIM_GRANTED,
+          "last dispatch pin wakes waiter");
+    chimera_vfs_claim_release(state, file, &range);
+    chimera_vfs_state_put(state, file);
+    chimera_vfs_state_destroy(state);
+} /* test_last_pin_wakes_waiter */
+
+static void
+test_shutdown_suppresses_deferred_pump(void)
+{
+    int pinned;
+
+    for (pinned = 0; pinned < 2; pinned++) {
+        struct chimera_vfs_state          *state = chimera_vfs_state_init();
+        struct chimera_vfs_file_state     *file  = get_file(state, 100);
+        struct chimera_claim_owner         owner;
+        struct chimera_vfs_claim           cache, range;
+        struct chimera_vfs_claim_grant    *first, *second;
+        struct chimera_vfs_claim_ref       ref;
+        struct chimera_vfs_pending_acquire ticket;
+        struct acquire_recorder            rec = { 0 };
+
+        init_owner(&owner, CHIMERA_CLAIM_PROTO_SMB2, 1, 1);
+        chimera_vfs_claim_init_oplock(&cache, CHIMERA_CLAIM_CR | CHIMERA_CLAIM_CW, &owner);
+        cache.break_cb = noop_break_cb;
+        assert(chimera_vfs_claim_grant_acquire(state, file, &cache, 0, 0,
+                                               CHIMERA_CLAIM_GRANT_EXACT, NULL, NULL, &first, NULL) ==
+               CHIMERA_CLAIM_GRANTED);
+        assert(chimera_vfs_claim_grant_acquire(state, file, &cache, 0, 0,
+                                               CHIMERA_CLAIM_GRANT_EXACT, NULL, NULL, &second, NULL) ==
+               CHIMERA_CLAIM_GRANTED);
+        assert(first == second);
+        if (pinned) {
+            evpl_mutex_lock(&file->lock);
+            assert(chimera_vfs_claim_ref_take(&first->claim, &ref));
+            evpl_mutex_unlock(&file->lock);
+        }
+        init_owner(&owner, CHIMERA_CLAIM_PROTO_SMB2, 2, 2);
+        chimera_vfs_claim_init_range(&range, true, false, 0, 100, &owner);
+        chimera_vfs_claim_acquire(NULL, state, file, &range, &ticket, true, false,
+                                  recording_acquire_cb, NULL, &rec);
+        CHECK(ticket.queued, "shutdown regression has a parked waiter");
+        chimera_vfs_claim_grant_release(state, first, true);
+        CHECK(!rec.fired, "normal member release leaves waiter blocked");
+        chimera_vfs_claim_grant_release(state, second, false);
+        if (pinned) {
+            chimera_vfs_claim_ref_drop(state, &ref);
+        }
+        CHECK(!rec.fired && ticket.queued, "shutdown suppresses deferred wakeup through final pin drop");
+        CHECK(file->grants == NULL, "shutdown still removes the final grant");
+        chimera_vfs_claim_cancel(state, &ticket);
+        chimera_vfs_state_put(state, file);
+        chimera_vfs_state_destroy(state);
+    }
+} /* test_shutdown_suppresses_deferred_pump */
 
 
 /* Main ---------------------------------------------------------------- */
@@ -2406,7 +2541,10 @@ main(
     test_write_trigger_legacy_self_break();
     test_midbreak_deepen_one_epoch();
     test_fuse_grant_sync_semantics();
+    test_last_pin_wakes_waiter();
+    test_shutdown_suppresses_deferred_pump();
     test_claim_owner_pin();
+    test_namespace_skips_refused_pin();
     test_try_acquire_breaking_conflict_pin_refused();
 
     fprintf(stderr, "\n========================================\n");

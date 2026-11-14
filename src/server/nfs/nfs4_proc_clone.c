@@ -117,6 +117,12 @@ chimera_nfs4_clone_issue(
     struct CLONE4args            *args = &req->args_compound->argarray[req->index].opclone;
     struct nfs4_clone_state_refs *refs = req->nfs_state_ref;
 
+    if (length > UINT64_MAX - args->cl_src_offset ||
+        length > UINT64_MAX - args->cl_dst_offset) {
+        chimera_nfs4_clone_finish(req, NFS4ERR_INVAL);
+        return;
+    }
+
     /* Reflink requires both files be served by the same module and that module
      * support clone_range; otherwise it is not a supported operation. */
     if (refs->src_handle->vfs_module != refs->dst_handle->vfs_module ||
@@ -134,12 +140,7 @@ chimera_nfs4_clone_issue(
                             req);
 } /* chimera_nfs4_clone_issue */
 
-/* RFC 7862 §15.13.3: if the source offset plus count is greater than the
- * size of the source file, the operation MUST fail with NFS4ERR_INVAL.
- * cl_count == 0 means "to EOF" (quint: cnt = max(0, size - srcOff)), so an
- * offset at or past EOF in that case is simply nothing to clone -- a no-op
- * success, not an error.  The size is not known until the handle is open,
- * hence the extra round trip -- same shape as COPY's bounds check. */
+/* Clone-to-EOF needs an authoritative source size (RFC 7862 15.13.3). */
 static void
 chimera_nfs4_clone_getattr_complete(
     enum chimera_vfs_error    error_code,
@@ -157,21 +158,15 @@ chimera_nfs4_clone_getattr_complete(
 
     src_size = (attr->va_set_mask & CHIMERA_VFS_ATTR_SIZE) ? attr->va_size : 0;
 
-    if (args->cl_count == 0) {
-        /* Clone from cl_src_offset to the end of the source.  If the offset
-         * is at or past EOF there is nothing to clone. */
-        length = (args->cl_src_offset < src_size) ? (src_size - args->cl_src_offset) : 0;
-        if (length == 0) {
-            chimera_nfs4_clone_finish(req, NFS4_OK);
-            return;
-        }
-    } else {
-        if (args->cl_src_offset > src_size ||
-            args->cl_count > src_size - args->cl_src_offset) {
-            chimera_nfs4_clone_finish(req, NFS4ERR_INVAL);
-            return;
-        }
-        length = args->cl_count;
+    if (args->cl_src_offset > src_size) {
+        chimera_nfs4_clone_finish(req, NFS4ERR_INVAL);
+        return;
+    }
+
+    length = src_size - args->cl_src_offset;
+    if (length == 0) {
+        chimera_nfs4_clone_finish(req, NFS4_OK);
+        return;
     }
 
     /* If SAVED_FH and CURRENT_FH name the same file, the source and target
@@ -210,13 +205,16 @@ chimera_nfs4_clone_begin(struct nfs_request *req)
     refs->src_handle = src_handle;
     refs->dst_handle = dst_handle;
 
-    /* Always resolve the source size: it bounds a clone-to-EOF and validates
-     * an explicit count against the source file's actual size. */
-    chimera_vfs_getattr(req->thread->vfs_thread, &req->cred,
-                        src_handle,
-                        CHIMERA_VFS_ATTR_SIZE,
-                        chimera_nfs4_clone_getattr_complete,
-                        req);
+    if (req->args_compound->argarray[req->index].opclone.cl_count != 0) {
+        chimera_nfs4_clone_issue(req, req->args_compound->argarray[req->index].opclone.cl_count);
+        return;
+    }
+
+    chimera_vfs_getattr_fresh(req->thread->vfs_thread, &req->cred,
+                              src_handle,
+                              CHIMERA_VFS_ATTR_SIZE,
+                              chimera_nfs4_clone_getattr_complete,
+                              req);
 } /* chimera_nfs4_clone_begin */
 
 static void
