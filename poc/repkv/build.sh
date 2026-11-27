@@ -8,6 +8,8 @@ BLD=${2:-$SRC/build/Release}
 HERE=$(cd "$(dirname "$0")" && pwd)
 OUT=$HERE/build
 mkdir -p "$OUT"
+# The arm64 build of chimera uses -march=armv8-a; other machines take the compiler default.
+MARCH=; [ "$(uname -m)" = aarch64 ] && MARCH=-march=armv8-a
 
 cc -DCHIMERA_HAVE_URCU -DURCU_API_MAP -D_LGPL_SOURCE -DXXH_INLINE_ALL -DOTEL_TRACING=0 \
    -I"$SRC/ext/libevpl/ext/prometheus-c" \
@@ -17,7 +19,7 @@ cc -DCHIMERA_HAVE_URCU -DURCU_API_MAP -D_LGPL_SOURCE -DXXH_INLINE_ALL -DOTEL_TRA
    -I"$SRC/ext/libevpl/ext/oteltracing-c" \
    -I"$SRC/src" \
    -O3 -DNDEBUG -std=gnu11 -fPIC -fno-omit-frame-pointer -g -Wall -Werror \
-   -Wno-unused-function -fvisibility=hidden -march=armv8-a \
+   -Wno-unused-function -fvisibility=hidden $MARCH \
    -c "$HERE/repkv.c" -o "$OUT/repkv.o"
 
 cc -shared -Wl,--no-as-needed -o "$OUT/libchimera_vfs_repkv.so" "$OUT/repkv.o" \
