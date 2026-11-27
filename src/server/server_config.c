@@ -299,6 +299,7 @@ chimera_server_config_init(void)
      * server restart.  Recovery-record persistence is independent and always
      * on. */
     config->nfs4_drc = 0;
+    config->nfs4_drc_replay_only = 0;
     /* NFSv3 duplicate-request cache.  Default off.  When enabled, the reply of
      * a non-idempotent NFSv3 op is captured and (if kv_module is persistent)
      * written through to the KV store keyed by {client, xid, proc, checksum},
@@ -775,6 +776,20 @@ chimera_server_config_get_nfs4_drc(const struct chimera_server_config *config)
 {
     return config->nfs4_drc;
 } /* chimera_server_config_get_nfs4_drc */
+
+SYMBOL_EXPORT void
+chimera_server_config_set_nfs4_drc_replay_only(
+    struct chimera_server_config *config,
+    int                           mode)
+{
+    config->nfs4_drc_replay_only = mode;
+} /* chimera_server_config_set_nfs4_drc_replay_only */
+
+SYMBOL_EXPORT int
+chimera_server_config_get_nfs4_drc_replay_only(const struct chimera_server_config *config)
+{
+    return config->nfs4_drc_replay_only;
+} /* chimera_server_config_get_nfs4_drc_replay_only */
 
 SYMBOL_EXPORT void
 chimera_server_config_set_nfs3_drc(

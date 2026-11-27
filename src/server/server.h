@@ -299,6 +299,19 @@ SYMBOL_EXPORT int
 chimera_server_config_get_nfs4_drc(
     const struct chimera_server_config *config);
 
+/* What a session rebuilt from the store may do.  0: carry on as a live
+ * session.  1: answer retries of stored replies only, NFS4ERR_DEADSESSION
+ * for anything else (RFC 8881 Section 2.10.6.5).  2: as 1, and the rebuilt
+ * client also takes its CREATE_SESSION sequence from the record. */
+SYMBOL_EXPORT void
+chimera_server_config_set_nfs4_drc_replay_only(
+    struct chimera_server_config *config,
+    int                           mode);
+
+SYMBOL_EXPORT int
+chimera_server_config_get_nfs4_drc_replay_only(
+    const struct chimera_server_config *config);
+
 SYMBOL_EXPORT void
 chimera_server_config_set_nfs3_drc(
     struct chimera_server_config *config,

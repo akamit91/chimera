@@ -245,7 +245,8 @@ chimera_nfs4_create_session(
             rec_flags |= NFS4_DRC_SESSION_RECLAIM_COMPLETE;
         }
         nfs4_drc_persist_session(thread->vfs_thread, session, &principal,
-                                 args->csa_cb_program, rec_flags);
+                                 args->csa_cb_program, rec_flags,
+                                 args->csa_sequence);
     }
 
     /* The callback program and security (RFC 8881 §18.36.3 csa_cb_program,

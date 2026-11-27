@@ -95,9 +95,20 @@ chimera_nfs4_sequence(
         nfsstat4 hs = (nfs4_drc_session_hydrate(thread, args->sa_sessionid) ==
                        NFS4_DRC_HYDRATE_INFLIGHT) ? NFS4ERR_DELAY
                                                   : NFS4ERR_BADSESSION;
-        res->sr_status = hs;
-        chimera_nfs4_compound_complete(req, hs);
-        return;
+
+        /* A store that answers from memory settles the whole hydrate before
+         * the call above returns.  The session is then live already, and the
+         * request carries on instead of sending the client away. */
+        if (hs == NFS4ERR_DELAY) {
+            session = nfs4_session_lookup(
+                &thread->shared->nfs4_shared_clients,
+                args->sa_sessionid);
+        }
+        if (!session) {
+            res->sr_status = hs;
+            chimera_nfs4_compound_complete(req, hs);
+            return;
+        }
     }
 
     if (nfs4_drc_session_hydrating(thread, args->sa_sessionid)) {

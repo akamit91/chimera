@@ -85,6 +85,10 @@ struct nfs4_replay_slot {
     /* The KV store holds a reply record for the current seqid; it outlives a
      * demotion to COMPLETED and is retired when the slot advances. */
     bool             persisted;
+    /* Installed from a stored reply record and not advanced since.  The
+     * record marks the last CACHED request; requests that left no record may
+     * have moved the client's seqid further (nfs4_replay_slot_acquire). */
+    bool             restored;
     /* Who sent the request this slot holds.  RFC 8881 Section 2.10.6.1.3.1: a
      * retry "that uses a different principal in the RPC request's credential
      * field that translates to a different user" is a false retry, and "if the
@@ -315,6 +319,11 @@ struct nfs4_session {
      * slot is answered NFS4ERR_DELAY: the scan may still install that slot's
      * reply record. */
     _Atomic bool                      replay_hydrating;
+    /* A rebuilt session that only answers retries of its stored replies; any
+     * other request is answered NFS4ERR_DEADSESSION and the client makes a
+     * new session (RFC 8881 Section 2.10.6.5).  Set by the hydrate before any
+     * slot can be used (server.nfs4_drc_replay_only). */
+    _Atomic bool                      replay_dead;
     /* NFSv4.1 backchannel for delegation recalls (RFC 8881 §2.10.3.1).
      * cb_program and the cb_sec_* callback security (csa_sec_parms) belong to
      * the session: CREATE_SESSION records them whether or not it asks for a
@@ -531,6 +540,14 @@ bool
 nfs4_client_needs_reclaim_complete(
     struct nfs4_client_table *table,
     uint64_t                  client_id);
+
+/* A client rebuilt from a session record takes the CREATE_SESSION sequence
+ * that created the session, so its next CREATE_SESSION is in order here. */
+void
+nfs4_client_restore_cs_seqid(
+    struct nfs4_client_table *table,
+    uint64_t                  client_id,
+    uint32_t                  cs_seqid);
 
 /* A client rebuilt from its session record after its node died: clear
  * reclaim_complete so it may reclaim here, recording in `recovered` whether

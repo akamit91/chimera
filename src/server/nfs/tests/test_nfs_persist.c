@@ -79,9 +79,9 @@ test_key_encoding(void)
     CHECK(rkey[0] == CHIMERA_KV_MAGIC && rkey[1] == CHIMERA_KV_VERSION);
     CHECK(rkey[2] == CHIMERA_KV_TYPE_NFS4_REPLY);
     CHECK(memcmp(rkey + CHIMERA_KV_HDR_LEN, sid, NFS4_SESSIONID_SIZE) == 0);
-    /* slotid + seqid encoded little-endian after the sessionid. */
+    /* slotid encoded little-endian after the sessionid; the seqid is not in
+     * the key (one record per slot). */
     CHECK(nfs_kv_le32(rkey + CHIMERA_KV_HDR_LEN + NFS4_SESSIONID_SIZE) == 7);
-    CHECK(nfs_kv_le32(rkey + CHIMERA_KV_HDR_LEN + NFS4_SESSIONID_SIZE + 4) == 9);
 
     klen = nfs_kv_session_key(skey, sid);
     CHECK(klen == CHIMERA_KV_SESSION_KEY_LEN);

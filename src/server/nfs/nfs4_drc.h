@@ -68,7 +68,8 @@ nfs4_drc_persist_session(
     struct nfs4_session                *session,
     const struct nfs4_client_principal *principal,
     uint32_t                            cb_program,
-    uint32_t                            flags);
+    uint32_t                            flags,
+    uint32_t                            cs_seqid);
 
 /* Session-record flag (outside the CREATE_SESSION4_FLAG_* space): the client
  * had completed reclaim, so a node it fails over to does not wait for a second
@@ -157,6 +158,9 @@ struct nfs4_drc_session_record {
     uint16_t              owner_len;
     uint8_t               mach[NFS4_OPAQUE_LIMIT];
     uint8_t               owner[NFS4_OPAQUE_LIMIT];
+    /* The csa_sequence of the CREATE_SESSION that made the session.  Kept as
+     * an optional trailer after the owner: a record without it reads as 0. */
+    uint32_t              cs_seqid;
 };
 
 /* Returns bytes written (0 on overflow). */

@@ -983,6 +983,20 @@ chimera_vfs_put_key_if_absent(
     chimera_vfs_put_key_callback_t callback,
     void                          *private_data);
 
+/* Versioned put: the value replaces the stored one only if `version` is not
+ * older than the stored version (CHIMERA_VFS_PUT_KEY_IF_NEWER).  For records
+ * that are overwritten in place and may reach a store out of order. */
+SYMBOL_EXPORT void
+chimera_vfs_put_key_versioned(
+    struct chimera_vfs_thread     *thread,
+    const void                    *key,
+    uint32_t                       key_len,
+    const void                    *value,
+    uint32_t                       value_len,
+    uint32_t                       version,
+    chimera_vfs_put_key_callback_t callback,
+    void                          *private_data);
+
 /* fh-routed put: store a key/value associated with the backend serving `fh`
  * (used to persist handle-state for backends without native KV; see
  * chimera_vfs_kv_route_fh). */

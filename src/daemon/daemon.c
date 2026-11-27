@@ -780,6 +780,12 @@ apply_nfs_config(
         chimera_server_config_set_nfs4_drc(server_config, json_is_true(json_value));
     }
 
+    json_value = json_object_get(server_params, "nfs4_drc_replay_only");
+    if (json_is_integer(json_value)) {
+        chimera_server_config_set_nfs4_drc_replay_only(server_config,
+                                                       json_integer_value(json_value));
+    }
+
     json_value = json_object_get(server_params, "nfs3_drc");
     if (json_is_boolean(json_value)) {
         chimera_server_config_set_nfs3_drc(server_config, json_is_true(json_value));

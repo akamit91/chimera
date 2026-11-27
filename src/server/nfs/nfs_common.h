@@ -475,6 +475,9 @@ struct chimera_server_nfs_shared {
     /* Fore-channel slot cap: what CREATE_SESSION grants and a rebuilt session
      * keeps. */
     uint32_t                            nfs4_max_slots;
+    /* server.nfs4_drc_replay_only: what a rebuilt session may do (see
+     * chimera_server_config_set_nfs4_drc_replay_only). */
+    int                                 nfs4_drc_replay_only;
 
     struct nfs4_client_table            nfs4_shared_clients;
     struct nfs_state_table              nfs4_state_table;

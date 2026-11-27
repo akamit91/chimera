@@ -476,6 +476,8 @@ nfs_server_init(
     if (shared->nfs4_max_slots == 0) {
         shared->nfs4_max_slots = NFS4_MAX_REPLY_CACHE_SLOTS;
     }
+    shared->nfs4_drc_replay_only =
+        chimera_server_config_get_nfs4_drc_replay_only(config);
 
     /* A held NFSv3 retransmit may wait out an NFSv4 delegation recall, which
      * lasts up to a lease (nfs3_drc.c). */

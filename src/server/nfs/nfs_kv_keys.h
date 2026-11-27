@@ -236,9 +236,11 @@ nfs_kv_session_key(
     return p + NFS4_SESSIONID_SIZE;
 } /* nfs_kv_session_key */
 
-/* 4.1 reply-cache slot key = [hdr] + sessionid + slotid + seqid.  CLIENT-scoped
- * like the session key; the [hdr] + sessionid prefix scans one client's whole
- * reply band for the lazy hydrate. */
+/* 4.1 reply-cache slot key = [hdr] + sessionid + slotid.  CLIENT-scoped like
+ * the session key; the [hdr] + sessionid prefix scans one client's whole reply
+ * band for the lazy hydrate.  One key per slot: a slot's new reply overwrites
+ * its previous one, so a cached request costs one put and nothing is deleted
+ * when the slot advances.  The seqid is in the value. */
 static inline uint32_t
 nfs_kv_reply_key(
     uint8_t       *buf,
@@ -248,10 +250,10 @@ nfs_kv_reply_key(
 {
     uint32_t p = nfs_kv_type_prefix(buf, CHIMERA_KV_TYPE_NFS4_REPLY);
 
+    (void) seqid;
     memcpy(buf + p, sessionid, NFS4_SESSIONID_SIZE);
     p += NFS4_SESSIONID_SIZE;
     nfs_kv_put_le32(buf, &p, slotid);
-    nfs_kv_put_le32(buf, &p, seqid);
     return p;
 } /* nfs_kv_reply_key */
 
@@ -259,7 +261,7 @@ nfs_kv_reply_key(
  * metadata record, or that session's whole reply band). */
 #define CHIMERA_KV_SESSION_PREFIX_LEN (CHIMERA_KV_HDR_LEN + NFS4_SESSIONID_SIZE)
 #define CHIMERA_KV_REPLY_KEY_LEN \
-        (CHIMERA_KV_HDR_LEN + NFS4_SESSIONID_SIZE + 4 + 4)
+        (CHIMERA_KV_HDR_LEN + NFS4_SESSIONID_SIZE + 4)
 #define CHIMERA_KV_SESSION_KEY_LEN    (CHIMERA_KV_HDR_LEN + NFS4_SESSIONID_SIZE)
 
 /* Connectionless-DRC reply key (NFSv3 and NFSv4.0 share this shape; `type`

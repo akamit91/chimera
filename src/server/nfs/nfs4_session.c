@@ -2021,6 +2021,27 @@ nfs4_replay_principal_digest(const struct nfs_request *req)
     return h;
 } /* nfs4_replay_principal_digest */
 
+void
+nfs4_client_restore_cs_seqid(
+    struct nfs4_client_table *table,
+    uint64_t                  client_id,
+    uint32_t                  cs_seqid)
+{
+    struct nfs4_client *c;
+
+    evpl_mutex_lock(&table->nfs4_ct_lock);
+
+    HASH_FIND(nfs4_client_hh_by_id, table->nfs4_ct_clients_by_id,
+              &client_id, sizeof(client_id), c);
+
+    if (c && (int32_t) (cs_seqid - c->nfs4_client_cs_seqid) > 0) {
+        c->nfs4_client_cs_seqid      = cs_seqid;
+        c->nfs4_client_cs_have_reply = 0;
+    }
+
+    evpl_mutex_unlock(&table->nfs4_ct_lock);
+} /* nfs4_client_restore_cs_seqid */
+
 nfsstat4
 nfs4_replay_slot_acquire(
     struct nfs4_session *session,
@@ -2033,6 +2054,7 @@ nfs4_replay_slot_acquire(
     struct nfs4_replay_slot *slot;
     nfsstat4                 status      = NFS4_OK;
     uint32_t                 freed_bytes = 0;
+    bool                     dead;
 
     *out_is_replay = false;
 
@@ -2043,6 +2065,15 @@ nfs4_replay_slot_acquire(
 
     slot = &session->replay_slots[slotid];
 
+    /* A dead session answers nothing until its reply scan has finished: the
+     * record for this very request may still be on its way.  Read before the
+     * slot word, so a clear flag means the scan's slots are visible below. */
+    dead = atomic_load_explicit(&session->replay_dead, memory_order_relaxed);
+    if (dead && atomic_load_explicit(&session->replay_hydrating,
+                                     memory_order_acquire)) {
+        return NFS4ERR_DELAY;
+    }
+
     /* Lock-free state machine.  Distinct slots never collide; the CAS only
      * ever actually contends on a same-slot retransmit racing the original
      * (possibly on another connection).  Losers re-read and observe
@@ -2052,6 +2083,27 @@ nfs4_replay_slot_acquire(
                                                         memory_order_acquire);
         enum nfs4_slot_state state = (enum nfs4_slot_state) (cur & NFS4_SLOT_STATE_MASK);
         uint32_t             cseq  = (uint32_t) (cur >> NFS4_SLOT_SEQID_SHIFT);
+
+        /*
+         * RFC 8881 Section 2.10.6.5: with just the session ID and slot table
+         * kept, "any requests the client retries after the server restart
+         * will return the results that are cached in the reply cache, and any
+         * new requests ... MUST be rejected with NFS4ERR_DEADSESSION".  The
+         * stored record is the slot's last cached reply, so only a request at
+         * exactly its seqid is a retry this node can answer; the branches
+         * below replay it (CACHED) or hold it off (IN_PROGRESS, a replay of
+         * it under way).
+         */
+        if (dead &&
+            !((state == NFS4_SLOT_CACHED || state == NFS4_SLOT_IN_PROGRESS) &&
+              seqid == cseq)) {
+            chimera_nfs_debug("nfs4 dead session: slot %u seqid %u is not a "
+                              "retry of a stored reply (stored seqid %u, "
+                              "state %d): NFS4ERR_DEADSESSION",
+                              slotid, seqid, cseq, (int) state);
+            status = NFS4ERR_DEADSESSION;
+            break;
+        }
 
         if (state == NFS4_SLOT_UNUSED) {
             /* First-ever use.  RFC 5661 sets csr_sequence = 1 at
@@ -2098,18 +2150,12 @@ nfs4_replay_slot_acquire(
                     atomic_fetch_sub_explicit(&session->replay_bytes_in_use,
                                               freed_bytes, memory_order_relaxed);
                 }
-                /* The client acknowledged the prior seqid by advancing;
-                 * drop its persisted reply so the KV store keeps at most
-                 * one entry per slot (the in-memory invariant).  A demoted
-                 * slot is COMPLETED but may still have one. */
-                if (slot->persisted) {
-                    slot->persisted = false;
-                    if (session->nfs4_session_persist && req->thread) {
-                        nfs4_drc_delete_reply(req->thread->vfs_thread,
-                                              session->nfs4_session_id,
-                                              slotid, cseq);
-                    }
-                }
+                /* The stored reply record is keyed by slot, so the next
+                 * cached reply overwrites it; nothing is deleted here.  Until
+                 * then the store keeps the last cached reply, which a restore
+                 * treats as a lower bound on the seqid (the jump branch
+                 * below). */
+                slot->restored = false;
                 req->replay_slot        = slot;
                 req->replay_session     = session;
                 req->replay_slot_id     = slotid;
@@ -2180,6 +2226,44 @@ nfs4_replay_slot_acquire(
                      * demoted for size).  We cannot replay the bytes. */
                     status = NFS4ERR_RETRY_UNCACHED_REP;
                 }
+            } else if (slot->restored && (int32_t) (seqid - cseq) > 1) {
+                /*
+                 * A slot restored from its stored record, and the client is
+                 * more than one request past it.  The record is the slot's
+                 * last CACHED reply; requests that asked for no caching moved
+                 * the seqid on and left nothing in the store.  The position
+                 * is unknown, exactly as for a slot with no record, and the
+                 * answer is the same: adopt the client's seqid and reply as an
+                 * uncached retry (see the RESYNC branch below).
+                 */
+                if (atomic_load_explicit(&session->replay_hydrating,
+                                         memory_order_acquire)) {
+                    status = NFS4ERR_DELAY;
+                    break;
+                }
+                if (!atomic_compare_exchange_weak_explicit(
+                        &slot->state_word, &cur,
+                        nfs4_slot_word(seqid, NFS4_SLOT_RESYNCING),
+                        memory_order_acq_rel, memory_order_acquire)) {
+                    continue;  /* lost the race; re-read and re-evaluate */
+                }
+                if (state == NFS4_SLOT_CACHED && slot->cached_buf) {
+                    freed_bytes = slot->cached_len;
+                    free(slot->cached_buf);
+                    slot->cached_buf = NULL;
+                    slot->cached_len = 0;
+                    atomic_fetch_sub_explicit(&session->replay_bytes_in_use,
+                                              freed_bytes, memory_order_relaxed);
+                }
+                slot->restored  = false;
+                slot->principal = nfs4_replay_principal_digest(req);
+                atomic_store_explicit(&slot->state_word,
+                                      nfs4_slot_word(seqid, NFS4_SLOT_COMPLETED),
+                                      memory_order_release);
+                chimera_nfs_debug("nfs4 session slot %u resynced to seqid %u "
+                                  "past its stored reply (seqid %u)",
+                                  slotid, seqid, cseq);
+                status = NFS4ERR_RETRY_UNCACHED_REP;
             } else {
                 status = NFS4ERR_SEQ_MISORDERED;
             }

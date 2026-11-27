@@ -65,9 +65,18 @@ chimera_nfs4_bind_conn_to_session(
         nfsstat4 hs = (nfs4_drc_session_hydrate(thread, args->bctsa_sessid) ==
                        NFS4_DRC_HYDRATE_INFLIGHT) ? NFS4ERR_DELAY
                                                   : NFS4ERR_BADSESSION;
-        res->bctsr_status = hs;
-        chimera_nfs4_compound_complete(req, hs);
-        return;
+
+        /* See nfs4_proc_sequence.c: a hydrate that settled before returning
+         * leaves the session live. */
+        if (hs == NFS4ERR_DELAY) {
+            session = nfs4_session_lookup(&thread->shared->nfs4_shared_clients,
+                                          args->bctsa_sessid);
+        }
+        if (!session) {
+            res->bctsr_status = hs;
+            chimera_nfs4_compound_complete(req, hs);
+            return;
+        }
     }
 
     if (nfs4_drc_session_hydrating(thread, args->bctsa_sessid)) {

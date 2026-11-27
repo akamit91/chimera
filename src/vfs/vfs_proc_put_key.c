@@ -26,6 +26,7 @@ chimera_vfs_put_key_flags(
     const void                    *value,
     uint32_t                       value_len,
     uint32_t                       flags,
+    uint32_t                       version,
     chimera_vfs_put_key_callback_t callback,
     void                          *private_data)
 {
@@ -45,6 +46,7 @@ chimera_vfs_put_key_flags(
     request->put_key.value      = value;
     request->put_key.value_len  = value_len;
     request->put_key.flags      = flags;
+    request->put_key.version    = version;
     request->proto_callback     = callback;
     request->proto_private_data = private_data;
 
@@ -61,7 +63,7 @@ chimera_vfs_put_key(
     chimera_vfs_put_key_callback_t callback,
     void                          *private_data)
 {
-    chimera_vfs_put_key_flags(thread, key, key_len, value, value_len, 0,
+    chimera_vfs_put_key_flags(thread, key, key_len, value, value_len, 0, 0,
                               callback, private_data);
 } /* chimera_vfs_put_key */
 
@@ -76,9 +78,25 @@ chimera_vfs_put_key_if_absent(
     void                          *private_data)
 {
     chimera_vfs_put_key_flags(thread, key, key_len, value, value_len,
-                              CHIMERA_VFS_PUT_KEY_IF_ABSENT,
+                              CHIMERA_VFS_PUT_KEY_IF_ABSENT, 0,
                               callback, private_data);
 } /* chimera_vfs_put_key_if_absent */
+
+SYMBOL_EXPORT void
+chimera_vfs_put_key_versioned(
+    struct chimera_vfs_thread     *thread,
+    const void                    *key,
+    uint32_t                       key_len,
+    const void                    *value,
+    uint32_t                       value_len,
+    uint32_t                       version,
+    chimera_vfs_put_key_callback_t callback,
+    void                          *private_data)
+{
+    chimera_vfs_put_key_flags(thread, key, key_len, value, value_len,
+                              CHIMERA_VFS_PUT_KEY_IF_NEWER, version,
+                              callback, private_data);
+} /* chimera_vfs_put_key_versioned */
 
 /* Store a key/value associated with the backend that serves `fh`.  If that
  * backend has native KV the record is stored co-located with the file;
@@ -140,6 +158,7 @@ chimera_vfs_put_key_at(
     request->put_key.value      = scratch + key_off + key_len;
     request->put_key.value_len  = value_len;
     request->put_key.flags      = 0;
+    request->put_key.version    = 0;
     request->proto_callback     = callback;
     request->proto_private_data = private_data;
 

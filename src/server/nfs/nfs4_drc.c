@@ -124,8 +124,12 @@ nfs4_drc_persist_reply(
                                               NFS4_DRC_REPLY_HDR_LEN + len,
                                               seqid, buf, len);
 
-    chimera_vfs_put_key(vfs_thread, ctx->key, ctx->key_len,
-                        ctx->value, ctx->value_len, nfs4_drc_kv_done, ctx);
+    /* One record per slot, overwritten in place: the seqid is its version, so
+     * a store that receives two of a slot's replies out of order keeps the
+     * later one. */
+    chimera_vfs_put_key_versioned(vfs_thread, ctx->key, ctx->key_len,
+                                  ctx->value, ctx->value_len, seqid,
+                                  nfs4_drc_kv_done, ctx);
 } /* nfs4_drc_persist_reply */
 
 void
@@ -202,6 +206,11 @@ nfs4_drc_session_serialize(
     memcpy(buf + p, r->owner, r->owner_len);
     p += r->owner_len;
 
+    /* Optional trailer, written when the caller left room for it. */
+    if (buf_size >= p + 4) {
+        nfs_kv_put_le32(buf, &p, r->cs_seqid);
+    }
+
     return p;
 } /* nfs4_drc_session_serialize */
 
@@ -250,6 +259,11 @@ nfs4_drc_session_deserialize(
     memcpy(out->mach, buf + p, out->mach_len);
     p += out->mach_len;
     memcpy(out->owner, buf + p, out->owner_len);
+    p += out->owner_len;
+
+    if (len >= p + 4) {
+        out->cs_seqid = nfs_kv_le32(buf + p);
+    }
 
     return 0;
 } /* nfs4_drc_session_deserialize */
@@ -260,7 +274,8 @@ nfs4_drc_persist_session(
     struct nfs4_session                *session,
     const struct nfs4_client_principal *principal,
     uint32_t                            cb_program,
-    uint32_t                            flags)
+    uint32_t                            flags,
+    uint32_t                            cs_seqid)
 {
     struct nfs_client             *uc = session->client_unified;
     struct nfs4_drc_kv_ctx        *ctx;
@@ -280,6 +295,7 @@ nfs4_drc_persist_session(
     rec.replay_maxresp_cached = session->replay_maxresp_cached;
     rec.cb_program            = cb_program;
     rec.flags                 = flags;
+    rec.cs_seqid              = cs_seqid;
     rec.fore                  = session->nfs4_session_fore_attrs;
     rec.back                  = session->nfs4_session_back_attrs;
     rec.mach_len              = principal ? principal->machinename_len : 0;
@@ -294,9 +310,9 @@ nfs4_drc_persist_session(
 
     ctx            = malloc(sizeof(*ctx));
     ctx->key_len   = nfs_kv_session_key(ctx->key, session->nfs4_session_id);
-    ctx->value     = malloc(NFS4_DRC_SESSION_HDR_LEN + rec.mach_len + rec.owner_len);
+    ctx->value     = malloc(NFS4_DRC_SESSION_HDR_LEN + rec.mach_len + rec.owner_len + 4);
     ctx->value_len = nfs4_drc_session_serialize(
-        ctx->value, NFS4_DRC_SESSION_HDR_LEN + rec.mach_len + rec.owner_len, &rec);
+        ctx->value, NFS4_DRC_SESSION_HDR_LEN + rec.mach_len + rec.owner_len + 4, &rec);
 
     chimera_vfs_put_key(vfs_thread, ctx->key, ctx->key_len,
                         ctx->value, ctx->value_len, nfs4_drc_kv_done, ctx);
@@ -398,7 +414,7 @@ nfs4_drc_rc_get_cb(
     }
 
     rec->flags |= NFS4_DRC_SESSION_RECLAIM_COMPLETE;
-    len         = NFS4_DRC_SESSION_HDR_LEN + rec->mach_len + rec->owner_len;
+    len         = NFS4_DRC_SESSION_HDR_LEN + rec->mach_len + rec->owner_len + 4;
     ctx->value  = malloc(len);
     if (!ctx->value) {
         free(rec);
@@ -843,6 +859,7 @@ nfs4_drc_repopulate_slot(
      * when its bytes are not kept: it pins the seqid, so an older record met
      * later in the scan cannot roll the slot back. */
     slot->persisted = true;
+    slot->restored  = true;
 
     /* The bytes come from the KV store, possibly written by a peer, and the
      * session's cap came from the same place.  A record this node could not
@@ -1058,8 +1075,7 @@ nfs4_drc_hydrate_reply_cb(
     const uint8_t                    *k      = key;
     const uint8_t                    *cached_data;
     struct nfs4_session              *session;
-    uint32_t                          slotid, seqid, cached_len, okey_len;
-    uint8_t                           okey[CHIMERA_KV_REPLY_KEY_LEN];
+    uint32_t                          slotid, seqid, cached_len;
     int64_t                           superseded;
     uint64_t                          bytes_before;
 
@@ -1095,17 +1111,20 @@ nfs4_drc_hydrate_reply_cb(
         case NFS4_DRC_REPOPULATE_KEPT:
             break;
         case NFS4_DRC_REPOPULATE_STALE:
-            chimera_nfs_debug("nfs4 drc dropping stale reply record "
+            /* The record is keyed by slot alone, so deleting it by key could
+             * remove a newer reply the live slot stored after this scan read
+             * the old one.  A stale record needs no delete: the slot's next
+             * cached reply overwrites it, and a restore treats it as a lower
+             * bound on the seqid. */
+            chimera_nfs_debug("nfs4 drc ignoring stale reply record "
                               "slot %u seqid %u", slotid, seqid);
-            nfs4_drc_hydrate_drop(ctx, key, key_len);
+            ctx->nstale++;
             break;
     } /* switch */
 
-    if (superseded >= 0) {
-        okey_len = nfs_kv_reply_key(okey, ctx->sessionid, slotid,
-                                    (uint32_t) superseded);
-        nfs4_drc_hydrate_drop(ctx, okey, okey_len);
-    }
+    /* One record per slot: a scan cannot meet two for the same slot, and a
+     * superseded record has no key of its own to delete. */
+    (void) superseded;
 
     if (thread->shared->replay_metrics.bytes_in_use) {
         prometheus_gauge_add(thread->shared->replay_metrics.bytes_in_use,
@@ -1241,6 +1260,32 @@ nfs4_drc_hydrate_rebuild(
         &shared->nfs4_shared_clients, ctx->sessionid, &ctx->srec,
         shared->nfs4_recovery.current_boot_id, shared->nfs4_max_slots);
     ctx->restored = ctx->hydrated != NULL;
+
+    /* Replay-only: the rebuilt session answers retries of its stored replies
+     * and nothing else.  Every slot is still RESYNC and the reply scan has
+     * not started, so no request can have used the session yet. */
+    if (ctx->restored) {
+        int replay_only = shared->nfs4_drc_replay_only;
+
+        if (replay_only) {
+            struct nfs4_session *dead_session = nfs4_session_lookup(
+                &shared->nfs4_shared_clients, ctx->sessionid);
+
+            if (dead_session) {
+                atomic_store_explicit(&dead_session->replay_dead, true,
+                                      memory_order_relaxed);
+                nfs4_session_put(dead_session);
+            }
+            chimera_nfs_info("NFS4.1 DRC: rebuilt session is replay-only "
+                             "(mode %d, record cs_seqid %u)",
+                             replay_only, ctx->srec.cs_seqid);
+        }
+        if (replay_only == 2) {
+            nfs4_client_restore_cs_seqid(&shared->nfs4_shared_clients,
+                                         ctx->srec.clientid,
+                                         ctx->srec.cs_seqid);
+        }
+    }
 
     if (failed_over && ctx->restored) {
         /* The client's node died with its state, and that state's grace window

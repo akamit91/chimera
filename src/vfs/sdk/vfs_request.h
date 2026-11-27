@@ -460,6 +460,14 @@ typedef void (*chimera_vfs_put_key_callback_t)(
  * must honour it atomically: callers treat OK as an exclusive win. */
 #define CHIMERA_VFS_PUT_KEY_IF_ABSENT 0x00000001U
 
+/* put_key flag: the put carries a version (put_key.version).  A backend that
+ * honours it stores the value only if the key is absent or the stored version
+ * is not newer, and completes with OK either way: an older write that arrives
+ * late is dropped, not reported.  Versions compare as 32-bit serial numbers,
+ * so a counter that wraps still orders correctly within half its range.  A
+ * backend that does not know the flag stores the value unconditionally. */
+#define CHIMERA_VFS_PUT_KEY_IF_NEWER  0x00000002U
+
 typedef void (*chimera_vfs_get_key_callback_t)(
     enum chimera_vfs_error error_code,
     const void            *value,
@@ -1256,6 +1264,7 @@ struct chimera_vfs_request {
             const void *value;
             uint32_t    value_len;
             uint32_t    flags;
+            uint32_t    version; /* with CHIMERA_VFS_PUT_KEY_IF_NEWER */
         } put_key;
 
         struct {

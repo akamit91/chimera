@@ -94,6 +94,7 @@ struct chimera_server_config {
     int                                   nfs4_session_slots;
     int                                   nfs4_delegations;
     int                                   nfs4_drc;
+    int                                   nfs4_drc_replay_only;
     int                                   nfs3_drc;
     int                                   nfs3_nsm_persist;
     char                                  nfs_nsm_name[256];
